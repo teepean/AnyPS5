@@ -397,6 +397,18 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
 
+bool DrawPipeline::OverlapsKnown(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        if (!item.ready) continue;
+        for (const auto& [begin, limit] : item.writes) {
+            if (address < limit && begin < end) return true;
+        }
+    }
+    return false;
+}
+
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;

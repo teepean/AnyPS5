@@ -70,6 +70,10 @@ public:
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // Overlaps with the writes known now: places still being prepared count as not overlapping.
+    // For checks that cannot change what the packet reads (an indirect register list is read at
+    // submit, Driver::readRegisterLists).
+    bool OverlapsKnown(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
 
 private:

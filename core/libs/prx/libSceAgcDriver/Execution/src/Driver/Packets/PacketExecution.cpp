@@ -32,7 +32,8 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
         case 0x63: case 0x64: case 0x9f:
-            return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
+            // The list was read at submit (readRegisterLists): only known queued writes are checked.
+            return packet.size() >= 5 && !DrawPipeline::Queue0().OverlapsKnown(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
         case 0x10: {
             const auto operation = (header >> 2u) & 0x3fu;
             return operation == 0 || operation == 0x09 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
