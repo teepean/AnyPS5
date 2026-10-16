@@ -20,6 +20,69 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
 
 }
 
+namespace {
+
+class PreparationPool {
+public:
+    void Submit(std::function<void()> job) {
+        std::lock_guard lock(mutex);
+        if (threads.empty()) {
+            for (std::size_t index = 0; index < DrawPreparation::Threads(); ++index) threads.emplace_back([this] { run(); });
+        }
+        jobs.push_back(std::move(job));
+        ++pending;
+        ready.notify_one();
+    }
+    void AwaitIdle() {
+        std::unique_lock lock(mutex);
+        done.wait(lock, [&] { return pending == 0; });
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            ready.wait(lock, [&] { return !jobs.empty(); });
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+            job();
+            job = nullptr;
+            lock.lock();
+            if (--pending == 0) done.notify_all();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable done;
+    std::deque<std::function<void()>> jobs;
+    std::size_t pending = 0;
+    std::vector<std::thread> threads;
+};
+
+PreparationPool& preparationPool() {
+    static auto* pool = new PreparationPool();
+    return *pool;
+}
+
+}
+
+std::size_t DrawPreparation::Threads() {
+    static const std::size_t threads = [] {
+        const char* text = std::getenv("APS5_PREP_THREADS");
+        return text != nullptr ? static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 16)) : std::size_t{0};
+    }();
+    return DrawPipeline::Depth() != 0 ? threads : 0;
+}
+
+void DrawPreparation::Submit(std::function<void()> job) {
+    preparationPool().Submit(std::move(job));
+}
+
+void DrawPreparation::AwaitIdle() {
+    if (Threads() != 0) preparationPool().AwaitIdle();
+}
+
 DrawPipeline& DrawPipeline::Queue0() {
     static DrawPipeline* pipeline = new DrawPipeline();
     return *pipeline;
@@ -65,10 +128,91 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
+std::uint64_t& DrawPipeline::PreparingTicket() {
+    static thread_local std::uint64_t ticket = 0;
+    return ticket;
+}
+
+std::deque<DrawPipeline::Item>::iterator DrawPipeline::reservation(std::uint64_t ticket) {
+    return std::find_if(items.begin(), items.end(), [&](const Item& item) { return item.ticket == ticket; });
+}
+
+std::uint64_t DrawPipeline::Reserve() {
+    std::unique_lock lock(mutex);
+    rethrowFailure();
+    if (items.size() >= Depth()) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the reserving thread holds the GPU lock");
+        const auto start = std::chrono::steady_clock::now();
+        ++idleWaiters;
+        idle.wait(lock, [&] { return items.size() < Depth(); });
+        --idleWaiters;
+        fullWaitNs += elapsedNs(start);
+        rethrowFailure();
+    }
+    const auto ticket = nextTicket++;
+    Item item;
+    item.ticket = ticket;
+    item.ready = false;
+    depthSum += items.size();
+    items.push_back(std::move(item));
+    ++unready;
+    ++reserved;
+    outstanding.fetch_add(1, std::memory_order_release);
+    if (!thread.joinable()) thread = std::thread([this] { run(); });
+    return ticket;
+}
+
+void DrawPipeline::Cancel(std::uint64_t ticket) {
+    std::lock_guard lock(mutex);
+    const auto found = reservation(ticket);
+    if (found == items.end() || found->ready) return;
+    found->ready = true;
+    --unready;
+    if (found == items.begin() && committerWaiting) wake.notify_one();
+    if (unready == 0 && idleWaiters != 0) idle.notify_all();
+}
+
+void DrawPipeline::Fail(std::exception_ptr error) {
+    std::lock_guard lock(mutex);
+    if (failure == nullptr) failure = error;
+}
+
+void DrawPipeline::AwaitPrepared() {
+    std::unique_lock lock(mutex);
+    if (unready == 0) return;
+    ++idleWaiters;
+    idle.wait(lock, [&] { return unready == 0; });
+    --idleWaiters;
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
+    if (const auto ticket = PreparingTicket(); ticket != 0) {
+        // A preparation fills its own place; anything more it enqueues follows that place.
+        auto found = reservation(ticket);
+        if (found == items.end()) throw std::runtime_error("draw preparation enqueued without its reservation");
+        ++enqueued;
+        if (!found->ready) {
+            found->commit = std::move(commit);
+            found->writes = std::move(writes);
+            found->labelAddress = labelAddress;
+            found->labelBytes = std::move(labelBytes);
+            found->ready = true;
+            --unready;
+            if (found == items.begin() && committerWaiting) wake.notify_one();
+            if (unready == 0 && idleWaiters != 0) idle.notify_all();
+            return;
+        }
+        auto last = found;
+        while (std::next(last) != items.end() && std::next(last)->ticket == ticket) ++last;
+        Item item{std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)};
+        item.ticket = ticket;
+        items.insert(std::next(last), std::move(item));
+        outstanding.fetch_add(1, std::memory_order_release);
+        return;
+    }
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
@@ -110,8 +254,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu prepared in parallel, committer waited %.0f ms for preparations, preparations waited %.0f ms for their turn; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(reserved), static_cast<double>(committerStallNs) / 1e6, static_cast<double>(turnWaitNs) / 1e6, drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = reserved = committerStallNs = turnWaitNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -122,9 +266,14 @@ void DrawPipeline::run() {
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty(); });
+            if (!items.empty() && !items.front().ready) {
+                const auto stall = std::chrono::steady_clock::now();
+                wake.wait(lock, [&] { return !items.empty() && items.front().ready; });
+                committerStallNs += elapsedNs(stall);
+            }
+            wake.wait(lock, [&] { return !items.empty() && items.front().ready; });
             committerWaiting = false;
-            commit = stopped ? nullptr : &items.front().commit;
+            commit = stopped || !items.front().commit ? nullptr : &items.front().commit;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -164,7 +313,13 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    if (const auto ticket = PreparingTicket(); ticket != 0) {
+        // A preparation waits for its turn: every place before its own has run.
+        idle.wait(lock, [&] { return items.empty() || items.front().ticket == ticket; });
+        turnWaitNs += elapsedNs(start);
+    } else {
+        idle.wait(lock, [&] { return items.empty(); });
+    }
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
@@ -181,6 +336,8 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    // A draw still being prepared may write the label too: no answer until it is filled.
+    if (unready != 0) return std::nullopt;
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
@@ -195,6 +352,8 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    // The writes of a draw still being prepared are not known yet.
+    if (unready != 0) return true;
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
             if (address < limit && begin < end) return true;

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -17,7 +18,20 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// The order-independent decisions of a draw (its validated fragment outputs, pipeline stages and
+// resource cache key), made by PrepareDraw on the thread that prepares the draw, so the committer
+// only looks them up. Null when they could not be made there; Draw then makes them as before.
+struct PreparedDraw {
+    std::set<std::uint32_t> fragmentOutputs;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    VkPipelineStageFlags shaderStages = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    bool keyed = false;
+    std::vector<std::uint32_t> contentKey;
+};
+std::shared_ptr<const PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDraw* prepared = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

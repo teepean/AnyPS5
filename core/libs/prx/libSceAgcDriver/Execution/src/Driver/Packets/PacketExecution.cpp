@@ -75,6 +75,7 @@ void Driver::execute(const Submission& submission) {
         bool pipelined;
         ~PipelineDrain() {
             if (!pipelined || std::uncaught_exceptions() == 0) return;
+            DrawPreparation::AwaitIdle();
             try {
                 DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
             } catch (...) {
@@ -341,6 +342,32 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
+        } else if (drawPacket && pipelined && DrawPreparation::Threads() != 0 && deferredLabels().labels.empty()) {
+            // Prepared on the pool (Driver::draw on a copy of the queue state); the reservation keeps
+            // the draw's place in the pipeline.
+            landPendingWaits(submission.queue);
+            timed(&WorkerProfile::drawMs, [&] {
+                auto state = std::make_shared<QueueState>(queue);
+                const auto ticket = DrawPipeline::Queue0().Reserve();
+                const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+                const auto packetOpcode = opcode;
+                DrawPreparation::Submit([this, state, packet, &submission, ticket, epoch, packetOpcode] {
+                    auto& pipeline = DrawPipeline::Queue0();
+                    DrawPipeline::PreparingTicket() = ticket;
+                    DrawPipeline::Active() = true;
+                    try {
+                        DrawPipeline::FollowEpoch(epoch);
+                        GuestMemory::SetCurrentPacket(packetOpcode, submission.queue);
+                        std::shared_lock deviceUse(deviceReplacement);
+                        std::string rejected;
+                        if (draw(*state, packet, submission, rejected) == DrawVerdict::Rejected) throw std::runtime_error(rejected);
+                    } catch (...) {
+                        pipeline.Fail(std::current_exception());
+                    }
+                    pipeline.Cancel(ticket);
+                    DrawPipeline::PreparingTicket() = 0;
+                });
+            });
         } else if (drawPacket) {
             landPendingWaits(submission.queue);
             bool drawn = false;
@@ -401,6 +428,8 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    // The preparations read this submission's packets: all of them return before it goes away.
+    if (pipelined) DrawPreparation::AwaitIdle();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

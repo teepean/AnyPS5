@@ -18,6 +18,16 @@
 
 namespace AgcDriver::DriverDetail {
 
+// Pool of threads that prepare queue 0's draws in parallel (APS5_PREP_THREADS=<n>, 0 or unset: off;
+// needs the draw pipeline). Jobs start in submission order; AwaitIdle waits until every submitted
+// job has returned.
+class DrawPreparation {
+public:
+    static std::size_t Threads();
+    static void Submit(std::function<void()> job);
+    static void AwaitIdle();
+};
+
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
@@ -32,6 +42,18 @@ public:
     static void FollowEpoch(std::uint64_t token);
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    // Parallel draw preparation (APS5_PREP_THREADS): the queue worker reserves a draw's place with
+    // Reserve, and the thread that prepares the draw (Driver::draw) fills it through Enqueue while
+    // that thread's PreparingTicket is the reservation's ticket, or Cancels it. The committer runs
+    // places strictly in order and waits at an unfilled one, so work the worker enqueues later (labels,
+    // DMA) never overtakes a draw still being prepared. A preparation's Drain waits only for the
+    // places before its own (it holds the next turn), the worker's for every place.
+    std::uint64_t Reserve();
+    void Cancel(std::uint64_t ticket);
+    void Fail(std::exception_ptr error);
+    // Waits until no reservation is unfilled (the worker, before a submission's packets go away).
+    void AwaitPrepared();
+    static std::uint64_t& PreparingTicket();
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
@@ -45,7 +67,11 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        // A reservation's ticket (0 for work the worker enqueued directly) and whether it is filled.
+        std::uint64_t ticket = 0;
+        bool ready = true;
     };
+    std::deque<Item>::iterator reservation(std::uint64_t ticket);
     DrawPipeline() = default;
     void run();
     void rethrowFailure();
@@ -57,6 +83,11 @@ private:
     std::deque<Item> items;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
+    std::uint64_t nextTicket = 1;
+    std::size_t unready = 0;
+    std::uint64_t reserved = 0;
+    std::uint64_t turnWaitNs = 0;
+    std::uint64_t committerStallNs = 0;
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
     bool stopped = false;
