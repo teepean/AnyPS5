@@ -3,6 +3,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -311,6 +312,8 @@ void Driver::execute(const Submission& submission) {
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
+            // A dispatch reads what earlier draws may write: their preparations finish first.
+            if (pipelined) DrawPipeline::Queue0().AwaitPrepared();
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
@@ -342,23 +345,29 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
-        } else if (drawPacket && pipelined && DrawPreparation::Threads() != 0 && deferredLabels().labels.empty()) {
+        } else if (drawPacket && pipelined && DrawPreparation::Threads() != 0 && deferredLabels().labels.empty() && !Pm4::IndirectDrawOpcode(opcode) && deviceUse.owns_lock()) {
             // Prepared on the pool (Driver::draw on a copy of the queue state); the reservation keeps
-            // the draw's place in the pipeline.
+            // the draw's place in the pipeline. The worker hands the job a share of the device gate
+            // (a pool thread never waits on the gate itself).
             landPendingWaits(submission.queue);
             timed(&WorkerProfile::drawMs, [&] {
+                PrimeRegisterFingerprints(queue);
                 auto state = std::make_shared<QueueState>(queue);
                 const auto ticket = DrawPipeline::Queue0().Reserve();
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
                 const auto packetOpcode = opcode;
+                deviceReplacement.AddShare();
                 DrawPreparation::Submit([this, state, packet, &submission, ticket, epoch, packetOpcode] {
                     auto& pipeline = DrawPipeline::Queue0();
+                    const bool wasActive = DrawPipeline::Active();
                     DrawPipeline::PreparingTicket() = ticket;
+                    DrawPipeline::PreparingEpoch() = epoch;
                     DrawPipeline::Active() = true;
                     try {
+                        DrawPipeline::PreparingVisibleFrom() = pipeline.FirstUnfilled();
+                        GuestMemory::TagGpuLockThread(submission.queue);
                         DrawPipeline::FollowEpoch(epoch);
                         GuestMemory::SetCurrentPacket(packetOpcode, submission.queue);
-                        std::shared_lock deviceUse(deviceReplacement);
                         std::string rejected;
                         if (draw(*state, packet, submission, rejected) == DrawVerdict::Rejected) throw std::runtime_error(rejected);
                     } catch (...) {
@@ -366,6 +375,8 @@ void Driver::execute(const Submission& submission) {
                     }
                     pipeline.Cancel(ticket);
                     DrawPipeline::PreparingTicket() = 0;
+                    DrawPipeline::Active() = wasActive;
+                    deviceReplacement.unlock_shared();
                 });
             });
         } else if (drawPacket) {

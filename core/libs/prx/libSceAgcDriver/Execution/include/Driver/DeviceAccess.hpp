@@ -29,6 +29,10 @@ class DeviceUseGate {
 public:
     void lock_shared();
     void unlock_shared();
+    // Another share for work handed to another thread by a caller that already holds one: never
+    // waits (a pending replacement cannot have started while the caller's share is held). The
+    // receiving thread releases it with unlock_shared.
+    void AddShare();
     void lock();
     void unlock();
 

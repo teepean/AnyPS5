@@ -26,6 +26,11 @@ void DeviceUseGate::lock_shared() {
     ++users;
 }
 
+void DeviceUseGate::AddShare() {
+    std::lock_guard lock(mutex);
+    ++users;
+}
+
 void DeviceUseGate::unlock_shared() {
     std::lock_guard lock(mutex);
     if (--users == 0) changed.notify_all();

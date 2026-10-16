@@ -13,6 +13,9 @@ struct RegisterStateKeyParts {
 };
 
 std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords = false, bool incremental = true, std::uint64_t* shapeKey = nullptr, RegisterStateKeyParts* parts = nullptr);
+// Gives the live queue state's register banks their key masks and fingerprints, so copies handed
+// to draw preparations carry them and keep the incremental fingerprint.
+void PrimeRegisterFingerprints(const QueueState& queue);
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry);
 
 }

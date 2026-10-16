@@ -576,11 +576,24 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
     if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+        if (const auto ticket = DrawPipeline::PreparingTicket(); ticket != 0) {
+            // Prepared in parallel: a draw before this one that was still being prepared when this
+            // capture ran may write what it read. Then this draw is redone in its turn, after them.
+            std::vector<DrawPipeline::Range> reads;
+            reads.reserve(memory.size());
+            for (const auto& region : memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+            if (DrawPipeline::Queue0().EarlierWritesOverlap(ticket, DrawPipeline::PreparingVisibleFrom(), reads)) {
+                DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
+                DrawPipeline::PreparingVisibleFrom() = ticket;
+                return draw(queue, packet, submission, rejected);
+            }
+        }
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
-        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        // A prepared draw follows the worker's epoch at its packet, not the token now.
+        const auto epoch = DrawPipeline::PreparingTicket() != 0 ? DrawPipeline::PreparingEpoch() : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         // On a preparation thread: the draw's order-independent decisions are made here, in
         // parallel with the other preparations, instead of on the committer.
         static const bool prepareCommit = std::getenv("APS5_NO_PREPARED_COMMIT") == nullptr;

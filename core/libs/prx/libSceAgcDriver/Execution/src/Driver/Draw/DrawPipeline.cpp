@@ -133,6 +133,63 @@ std::uint64_t& DrawPipeline::PreparingTicket() {
     return ticket;
 }
 
+std::uint64_t& DrawPipeline::PreparingEpoch() {
+    static thread_local std::uint64_t epoch = 0;
+    return epoch;
+}
+
+std::uint64_t& DrawPipeline::PreparingVisibleFrom() {
+    static thread_local std::uint64_t from = 0;
+    return from;
+}
+
+std::uint64_t DrawPipeline::FirstUnfilled() {
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        if (!item.ready) return item.ticket;
+    }
+    return nextTicket;
+}
+
+bool DrawPipeline::EarlierWritesOverlap(std::uint64_t ticket, std::uint64_t visibleFrom, std::span<const Range> reads) {
+    if (visibleFrom >= ticket) return false;
+    std::unique_lock lock(mutex);
+    const auto earlierUnfilled = [&] {
+        for (const auto& item : items) {
+            if (item.ticket == ticket) return false;
+            if (!item.ready) return true;
+        }
+        return false;
+    };
+    if (earlierUnfilled()) {
+        const auto start = std::chrono::steady_clock::now();
+        ++idleWaiters;
+        idle.wait(lock, [&] { return !earlierUnfilled(); });
+        --idleWaiters;
+        turnWaitNs += elapsedNs(start);
+    }
+    const auto overlaps = [&](const std::vector<Range>& writes) {
+        for (const auto& [begin, end] : writes) {
+            for (const auto& [readBegin, readEnd] : reads) {
+                if (begin < readEnd && readBegin < end) return true;
+            }
+        }
+        return false;
+    };
+    // The history no longer reaches back to the preparation's start: assume an overlap.
+    bool hit = visibleFrom < historyFrom;
+    for (const auto& [done, writes] : history) {
+        if (hit) break;
+        if (done >= visibleFrom && done < ticket) hit = overlaps(writes);
+    }
+    for (const auto& item : items) {
+        if (hit || item.ticket == ticket) break;
+        if (item.ticket >= visibleFrom && item.ticket < ticket) hit = overlaps(item.writes);
+    }
+    if (hit) ++redone;
+    return hit;
+}
+
 std::deque<DrawPipeline::Item>::iterator DrawPipeline::reservation(std::uint64_t ticket) {
     return std::find_if(items.begin(), items.end(), [&](const Item& item) { return item.ticket == ticket; });
 }
@@ -169,7 +226,7 @@ void DrawPipeline::Cancel(std::uint64_t ticket) {
     found->ready = true;
     --unready;
     if (found == items.begin() && committerWaiting) wake.notify_one();
-    if (unready == 0 && idleWaiters != 0) idle.notify_all();
+    if (idleWaiters != 0) idle.notify_all();
 }
 
 void DrawPipeline::Fail(std::exception_ptr error) {
@@ -202,7 +259,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             found->ready = true;
             --unready;
             if (found == items.begin() && committerWaiting) wake.notify_one();
-            if (unready == 0 && idleWaiters != 0) idle.notify_all();
+            if (idleWaiters != 0) idle.notify_all();
             return;
         }
         auto last = found;
@@ -254,8 +311,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu prepared in parallel, committer waited %.0f ms for preparations, preparations waited %.0f ms for their turn; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(reserved), static_cast<double>(committerStallNs) / 1e6, static_cast<double>(turnWaitNs) / 1e6, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = reserved = committerStallNs = turnWaitNs = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu prepared in parallel (%llu redone after an earlier one wrote their reads), committer waited %.0f ms for preparations, preparations waited %.0f ms for their turn; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(reserved), static_cast<unsigned long long>(redone), static_cast<double>(committerStallNs) / 1e6, static_cast<double>(turnWaitNs) / 1e6, drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = reserved = committerStallNs = turnWaitNs = redone = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -296,6 +353,14 @@ void DrawPipeline::run() {
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
         std::lock_guard lock(mutex);
+        if (const auto ticket = items.front().ticket; ticket != 0) {
+            constexpr std::size_t HistoryEntries = 4096;
+            if (!items.front().writes.empty()) history.emplace_back(ticket, std::move(items.front().writes));
+            while (history.size() > HistoryEntries) {
+                historyFrom = history.front().first + 1;
+                history.pop_front();
+            }
+        }
         items.pop_front();
         ++commits;
         commitNs += spent;
@@ -315,7 +380,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++idleWaiters;
     if (const auto ticket = PreparingTicket(); ticket != 0) {
         // A preparation waits for its turn: every place before its own has run.
-        idle.wait(lock, [&] { return items.empty() || items.front().ticket == ticket; });
+        idle.wait(lock, [&] { return items.empty() || items.front().ticket == ticket || reservation(ticket) == items.end(); });
         turnWaitNs += elapsedNs(start);
     } else {
         idle.wait(lock, [&] { return items.empty(); });
@@ -339,6 +404,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     // A draw still being prepared may write the label too: no answer until it is filled.
     if (unready != 0) return std::nullopt;
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        if (item->ticket != 0 && item->ticket == PreparingTicket()) continue;
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
         if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
@@ -352,7 +418,20 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
-    // The writes of a draw still being prepared are not known yet.
+    const auto ticket = PreparingTicket();
+    if (ticket != 0) {
+        // A preparation: only the filled places before its own; earlier places still being prepared
+        // are checked at its turn (EarlierWritesOverlap).
+        for (const auto& item : items) {
+            if (item.ticket == ticket) return false;
+            if (!item.ready) continue;
+            for (const auto& [begin, limit] : item.writes) {
+                if (address < limit && begin < end) return true;
+            }
+        }
+        return false;
+    }
+    // The worker: the writes of a draw still being prepared are not known yet.
     if (unready != 0) return true;
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {

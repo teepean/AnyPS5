@@ -12,6 +12,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -54,6 +55,16 @@ public:
     // Waits until no reservation is unfilled (the worker, before a submission's packets go away).
     void AwaitPrepared();
     static std::uint64_t& PreparingTicket();
+    // The worker's epoch token when the preparing draw's place was reserved (the commit follows it).
+    static std::uint64_t& PreparingEpoch();
+    // The first place not yet filled when the preparation started: every earlier one was visible to
+    // its capture checks (Overlaps).
+    static std::uint64_t& PreparingVisibleFrom();
+    std::uint64_t FirstUnfilled();
+    // At a preparation's turn to enqueue: waits until every earlier place is filled, then reports
+    // whether a place filled after the preparation started (its writes unknown to the capture
+    // checks) writes memory the preparation read. The preparation then redoes its draw in its turn.
+    bool EarlierWritesOverlap(std::uint64_t ticket, std::uint64_t visibleFrom, std::span<const Range> reads);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
@@ -84,6 +95,11 @@ private:
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint64_t nextTicket = 1;
+    // Writes of reserved places the committer already ran (ticket, writes), newest last, for
+    // EarlierWritesOverlap; bounded.
+    std::deque<std::pair<std::uint64_t, std::vector<Range>>> history;
+    std::uint64_t historyFrom = 1;
+    std::uint64_t redone = 0;
     std::size_t unready = 0;
     std::uint64_t reserved = 0;
     std::uint64_t turnWaitNs = 0;
