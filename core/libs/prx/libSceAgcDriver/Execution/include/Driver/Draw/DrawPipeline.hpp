@@ -95,6 +95,10 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
+    // The worker waiting for room (Reserve, Enqueue): woken one per finished place, apart from the
+    // waiters on `idle` (drains, turns, fills).
+    std::condition_variable room;
+    std::uint32_t roomWaiters = 0;
     std::deque<Item> items;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};

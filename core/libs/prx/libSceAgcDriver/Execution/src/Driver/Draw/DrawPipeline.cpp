@@ -83,6 +83,50 @@ void DrawPreparation::AwaitIdle() {
     if (Threads() != 0) preparationPool().AwaitIdle();
 }
 
+namespace {
+
+// Destroys finished commits (their captured preparation state) off the committer, which only moves
+// them here. Never stopped (process lifetime, like the committer).
+class CommitReclaim {
+public:
+    void Release(DrawPipeline::Commit commit) {
+        if (!commit) return;
+        std::lock_guard lock(mutex);
+        if (!thread.joinable()) thread = std::thread([this] { run(); });
+        released.push_back(std::move(commit));
+        if (released.size() == 1) ready.notify_one();
+    }
+
+private:
+    void run() {
+        std::deque<DrawPipeline::Commit> batch;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock, [&] { return !released.empty(); });
+                batch.swap(released);
+            }
+            batch.clear();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<DrawPipeline::Commit> released;
+    std::thread thread;
+};
+
+CommitReclaim& commitReclaim() {
+    static auto* reclaim = new CommitReclaim();
+    return *reclaim;
+}
+
+bool ReclaimCommits() {
+    static const bool enabled = std::getenv("APS5_NO_COMMIT_RECLAIM") == nullptr;
+    return enabled;
+}
+
+}
+
 DrawPipeline& DrawPipeline::Queue0() {
     static DrawPipeline* pipeline = new DrawPipeline();
     return *pipeline;
@@ -200,9 +244,9 @@ std::uint64_t DrawPipeline::Reserve() {
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the reserving thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        ++roomWaiters;
+        room.wait(lock, [&] { return items.size() < Depth(); });
+        --roomWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -273,9 +317,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        ++roomWaiters;
+        room.wait(lock, [&] { return items.size() < Depth(); });
+        --roomWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -352,22 +396,29 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
-        if (const auto ticket = items.front().ticket; ticket != 0) {
-            constexpr std::size_t HistoryEntries = 4096;
-            if (!items.front().writes.empty()) history.emplace_back(ticket, std::move(items.front().writes));
-            while (history.size() > HistoryEntries) {
-                historyFrom = history.front().first + 1;
-                history.pop_front();
+        Commit finished;
+        {
+            std::lock_guard lock(mutex);
+            if (const auto ticket = items.front().ticket; ticket != 0) {
+                constexpr std::size_t HistoryEntries = 4096;
+                if (!items.front().writes.empty()) history.emplace_back(ticket, std::move(items.front().writes));
+                while (history.size() > HistoryEntries) {
+                    historyFrom = history.front().first + 1;
+                    history.pop_front();
+                }
             }
+            // The commit's captures are destroyed outside the lock (on the reclaim thread by default).
+            finished = std::move(items.front().commit);
+            items.pop_front();
+            ++commits;
+            commitNs += spent;
+            if (failed) ++commitErrors;
+            if (fatal != nullptr && failure == nullptr) failure = fatal;
+            outstanding.fetch_sub(1, std::memory_order_release);
+            if (roomWaiters != 0) room.notify_one();
+            if (idleWaiters != 0) idle.notify_all();
         }
-        items.pop_front();
-        ++commits;
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0) idle.notify_all();
+        if (ReclaimCommits()) commitReclaim().Release(std::move(finished));
     }
 }
 
