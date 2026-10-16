@@ -94,7 +94,7 @@ public:
         std::lock_guard lock(mutex);
         if (!thread.joinable()) thread = std::thread([this] { run(); });
         released.push_back(std::move(commit));
-        if (released.size() == 1) ready.notify_one();
+        if (released.size() == 32) ready.notify_one();
     }
 
 private:
@@ -103,7 +103,7 @@ private:
         for (;;) {
             {
                 std::unique_lock lock(mutex);
-                ready.wait(lock, [&] { return !released.empty(); });
+                ready.wait_for(lock, std::chrono::milliseconds(2), [&] { return released.size() >= 32; });
                 batch.swap(released);
             }
             batch.clear();
@@ -207,9 +207,9 @@ bool DrawPipeline::EarlierWritesOverlap(std::uint64_t ticket, std::uint64_t visi
     };
     if (earlierUnfilled()) {
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return !earlierUnfilled(); });
-        --idleWaiters;
+        ++fillWaiters;
+        filled.wait(lock, [&] { return !earlierUnfilled(); });
+        --fillWaiters;
         turnWaitNs += elapsedNs(start);
     }
     const auto overlaps = [&](const std::vector<Range>& writes) {
@@ -270,7 +270,7 @@ void DrawPipeline::Cancel(std::uint64_t ticket) {
     found->ready = true;
     --unready;
     if (found == items.begin() && committerWaiting) wake.notify_one();
-    if (idleWaiters != 0) idle.notify_all();
+    if (fillWaiters != 0) filled.notify_all();
 }
 
 void DrawPipeline::Fail(std::exception_ptr error) {
@@ -281,9 +281,9 @@ void DrawPipeline::Fail(std::exception_ptr error) {
 void DrawPipeline::AwaitPrepared() {
     std::unique_lock lock(mutex);
     if (unready == 0) return;
-    ++idleWaiters;
-    idle.wait(lock, [&] { return unready == 0; });
-    --idleWaiters;
+    ++fillWaiters;
+    filled.wait(lock, [&] { return unready == 0; });
+    --fillWaiters;
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
@@ -303,7 +303,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             found->ready = true;
             --unready;
             if (found == items.begin() && committerWaiting) wake.notify_one();
-            if (idleWaiters != 0) idle.notify_all();
+            if (fillWaiters != 0) filled.notify_all();
             return;
         }
         auto last = found;
@@ -415,7 +415,8 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             outstanding.fetch_sub(1, std::memory_order_release);
-            if (roomWaiters != 0) room.notify_one();
+            // The worker waiting for room wakes at half depth and refills in a burst.
+            if (roomWaiters != 0 && items.size() <= Depth() / 2) room.notify_one();
             if (idleWaiters != 0) idle.notify_all();
         }
         if (ReclaimCommits()) commitReclaim().Release(std::move(finished));

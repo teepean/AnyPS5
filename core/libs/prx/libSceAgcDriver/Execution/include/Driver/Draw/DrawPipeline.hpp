@@ -99,6 +99,9 @@ private:
     // waiters on `idle` (drains, turns, fills).
     std::condition_variable room;
     std::uint32_t roomWaiters = 0;
+    // Waiters for a fill (EarlierWritesOverlap, AwaitPrepared), woken by fills and cancels only.
+    std::condition_variable filled;
+    std::uint32_t fillWaiters = 0;
     std::deque<Item> items;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
