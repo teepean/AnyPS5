@@ -333,7 +333,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::unique_ptr<IrProgram> program;
     std::vector<std::shared_ptr<const CompiledVariant>> variants;
     std::vector<EmissionFailure> emissionFailures;
-    // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
+    // The result memo, most recently used first, at most ResultMemoEntries() (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
 };
@@ -1116,7 +1116,14 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+std::size_t ResultMemoEntries() {
+    static const std::size_t entries = [] {
+        const char* text = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{256};
+    }();
+    return entries;
+}
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -1265,7 +1272,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
             source.memo.push_front({variant->artifact.variantId, hash, shared});
             source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
+            while (source.memo.size() > ResultMemoEntries()) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
                 source.memo.pop_back();
