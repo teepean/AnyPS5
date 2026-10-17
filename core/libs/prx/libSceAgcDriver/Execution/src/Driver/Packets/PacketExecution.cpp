@@ -184,7 +184,15 @@ void Driver::execute(const Submission& submission) {
         }
         if (pipelined && !predicated && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && orderedWaits && DrawPipeline::Queue0().Busy()) {
             const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
-            if (const auto value = DrawPipeline::Queue0().PendingLabel(awaited, Pm4::WaitAwaitedBytes(packet)); value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
+            const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+            auto& pipeline = DrawPipeline::Queue0();
+            bool unfilled = false;
+            auto value = pipeline.PendingLabel(awaited, awaitedBytes, &unfilled);
+            if (!value.has_value() && unfilled) {
+                pipeline.AwaitPrepared();
+                value = pipeline.PendingLabel(awaited, awaitedBytes);
+            }
+            if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;
                 gateOpened() = true;
                 recent.Record(cursor);

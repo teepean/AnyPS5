@@ -312,9 +312,12 @@ void DrawPipeline::Fail(std::exception_ptr error) {
 void DrawPipeline::AwaitPrepared() {
     std::unique_lock lock(mutex);
     if (unready == 0) return;
+    const auto start = std::chrono::steady_clock::now();
     ++fillWaiters;
     filled.wait(lock, [&] { return unready == 0; });
     --fillWaiters;
+    ++preparedWaits;
+    preparedWaitNs += elapsedNs(start);
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
@@ -386,8 +389,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu prepared in parallel (%llu redone after an earlier one wrote their reads), committer waited %.0f ms for preparations, preparations waited %.0f ms for their turn; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(reserved), static_cast<unsigned long long>(redone), static_cast<double>(committerStallNs) / 1e6, static_cast<double>(turnWaitNs) / 1e6, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = reserved = committerStallNs = turnWaitNs = redone = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu prepared in parallel (%llu redone after an earlier one wrote their reads), committer waited %.0f ms for preparations, preparations waited %.0f ms for their turn, the worker waited %llu times (%.0f ms) for outstanding preparations; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(reserved), static_cast<unsigned long long>(redone), static_cast<double>(committerStallNs) / 1e6, static_cast<double>(turnWaitNs) / 1e6, static_cast<unsigned long long>(preparedWaits), static_cast<double>(preparedWaitNs) / 1e6, drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = reserved = committerStallNs = turnWaitNs = redone = preparedWaits = preparedWaitNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -492,14 +495,16 @@ bool DrawPipeline::OverlapsKnown(std::uint64_t address, std::size_t bytes) {
     return false;
 }
 
-std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
+std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes, bool* unfilled) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
-    // A draw still being prepared may write the label too: no answer until it is filled.
-    if (unready != 0) return std::nullopt;
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         if (item->ticket != 0 && item->ticket == PreparingTicket()) continue;
+        if (!item->ready) {
+            if (unfilled != nullptr) *unfilled = true;
+            return std::nullopt;
+        }
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
         if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;

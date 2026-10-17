@@ -75,7 +75,7 @@ public:
     // For checks that cannot change what the packet reads (an indirect register list is read at
     // submit, Driver::readRegisterLists).
     bool OverlapsKnown(std::uint64_t address, std::size_t bytes);
-    std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
+    std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes, bool* unfilled = nullptr);
 
 private:
     struct Item {
@@ -116,6 +116,8 @@ private:
     std::uint64_t reserved = 0;
     std::uint64_t turnWaitNs = 0;
     std::uint64_t committerStallNs = 0;
+    std::uint64_t preparedWaits = 0;
+    std::uint64_t preparedWaitNs = 0;
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
     bool stopped = false;
