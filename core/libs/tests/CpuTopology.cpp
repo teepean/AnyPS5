@@ -22,6 +22,41 @@ static std::uint64_t Parse(const char* text) {
     return mask;
 }
 
+static CpuTopology::CpuFacts TwoDomains(std::uint64_t firstBytes, std::uint64_t secondBytes, unsigned coresPerDomain, std::uint64_t firstRank, std::uint64_t secondRank) {
+    CpuTopology::CpuFacts facts{};
+    const unsigned cores = coresPerDomain * 2;
+    std::uint64_t first = 0;
+    for (unsigned core = 0; core < cores; ++core) {
+        const auto pair = (std::uint64_t{1} << core) | (std::uint64_t{1} << (core + cores));
+        facts.siblings[core] = pair;
+        facts.siblings[core + cores] = pair;
+        facts.process |= pair;
+        if (core < coresPerDomain) first |= pair;
+    }
+    facts.domains.push_back({first, firstBytes, firstRank});
+    facts.domains.push_back({facts.process & ~first, secondBytes, secondRank});
+    return facts;
+}
+
+static void CacheDomainTests() {
+    using CpuTopology::ChooseCacheDomain;
+    const auto equal = ChooseCacheDomain(TwoDomains(32u << 20, 32u << 20, 8, 236, 201));
+    Require(equal.cpus == 0x00ff00ffull && equal.cores == 8 && equal.domains == 2, "two equal caches: the domain with the best-ranked core");
+    Require(ChooseCacheDomain(TwoDomains(32u << 20, 32u << 20, 8, 201, 236)).cpus == 0xff00ff00ull, "the better-ranked domain may be the second");
+    Require(ChooseCacheDomain(TwoDomains(32u << 20, 32u << 20, 8, 0, 0)).cpus == 0x00ff00ffull, "no ranking: the domain of the lowest cpu");
+    Require(ChooseCacheDomain(TwoDomains(96u << 20, 32u << 20, 8, 201, 236)).cpus == 0x00ff00ffull, "the larger cache wins over the ranking");
+    Require(ChooseCacheDomain(TwoDomains(32u << 20, 32u << 20, 6, 236, 201)).cpus == 0, "domains of fewer than 8 cores are left alone");
+    auto single = TwoDomains(32u << 20, 32u << 20, 8, 236, 201);
+    single.domains = {{single.process, 32u << 20, 236}};
+    Require(ChooseCacheDomain(single).cpus == 0, "one cache domain is left alone");
+    auto hybrid = TwoDomains(32u << 20, 32u << 20, 8, 236, 201);
+    hybrid.hybrid = true;
+    Require(ChooseCacheDomain(hybrid).cpus == 0, "hybrid layouts keep their own pinning");
+    auto noSiblings = TwoDomains(32u << 20, 32u << 20, 8, 236, 201);
+    noSiblings.siblings.fill(0);
+    Require(ChooseCacheDomain(noSiblings).cores == 16, "without sibling lists every cpu is a core");
+}
+
 int main() {
     Require(Parse("0-15\n") == 0xffffull, "range");
     Require(Parse("16-31\n") == 0xffff0000ull, "high range");
@@ -46,5 +81,6 @@ int main() {
     Require(CpuTopology::Pin(nullptr, ~layout.process) == 0, "mask outside the process is not applied");
     int dummy = 0;
     Require(CpuTopology::Pin(&dummy, first) == 0, "other threads are not pinned by handle");
+    CacheDomainTests();
     return 0;
 }

@@ -9,6 +9,8 @@ std::uint64_t WorkerAffinityMask();
 
 void PinWorkerThread(const char* role);
 
+void KeepThreadsInCacheDomain(bool now = false);
+
 }
 
 #endif

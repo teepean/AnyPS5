@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -165,6 +167,103 @@ inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mas
 inline void PinHelperThread(const char* role) {
     static const std::uint64_t mask = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
     if (mask != 0) PinTraced(role, nullptr, mask);
+}
+
+struct CacheDomain {
+    std::uint64_t cpus = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t bestRank = 0;
+};
+
+struct CpuFacts {
+    std::uint64_t process = 0;
+    bool hybrid = false;
+    std::vector<CacheDomain> domains;
+    std::array<std::uint64_t, 64> siblings{};
+};
+
+struct DomainPlacement {
+    std::uint64_t cpus = 0;
+    unsigned domains = 0;
+    unsigned cores = 0;
+};
+
+inline DomainPlacement ChooseCacheDomain(const CpuFacts& facts) {
+    if (facts.hybrid || facts.process == 0 || facts.domains.size() < 2) return {};
+    const auto lowest = [](std::uint64_t mask) { return mask & (~mask + 1); };
+    const auto home = *std::max_element(facts.domains.begin(), facts.domains.end(), [&](const CacheDomain& a, const CacheDomain& b) {
+        if (a.bytes != b.bytes) return a.bytes < b.bytes;
+        if (a.bestRank != b.bestRank) return a.bestRank < b.bestRank;
+        return lowest(a.cpus) > lowest(b.cpus);
+    });
+    unsigned cores = 0;
+    std::uint64_t seen = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu) {
+        if (((home.cpus >> cpu) & 1u) == 0 || ((seen >> cpu) & 1u) != 0) continue;
+        seen |= facts.siblings[cpu] != 0 ? facts.siblings[cpu] : std::uint64_t{1} << cpu;
+        ++cores;
+    }
+    if (cores < 8) return {};
+    return {home.cpus, static_cast<unsigned>(facts.domains.size()), cores};
+}
+
+#ifdef __linux__
+inline std::uint64_t NumberFromFile(const char* path) {
+    std::ifstream file(path);
+    std::string text;
+    if (!std::getline(file, text)) return 0;
+    char* end = nullptr;
+    auto value = std::strtoull(text.c_str(), &end, 10);
+    if (end != nullptr && (*end == 'K' || *end == 'k')) value <<= 10;
+    else if (end != nullptr && (*end == 'M' || *end == 'm')) value <<= 20;
+    return value;
+}
+
+inline CpuFacts ReadCpuFacts() {
+    CpuFacts facts{};
+    const auto& layout = Get();
+    facts.process = layout.process;
+    facts.hybrid = layout.hybrid;
+    for (unsigned cpu = 0; cpu < 64; ++cpu) {
+        if (((layout.process >> cpu) & 1u) == 0) continue;
+        char path[128];
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", cpu);
+        facts.siblings[cpu] = MaskFromCpuList(path) & layout.process;
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/cpufreq/amd_pstate_prefcore_ranking", cpu);
+        auto rank = NumberFromFile(path);
+        if (rank == 0) {
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/acpi_cppc/highest_perf", cpu);
+            rank = NumberFromFile(path);
+        }
+        for (unsigned index = 0; index < 8; ++index) {
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/cache/index%u/level", cpu, index);
+            if (NumberFromFile(path) != 3) continue;
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/cache/index%u/shared_cpu_list", cpu, index);
+            const auto cpus = MaskFromCpuList(path) & layout.process;
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/cache/index%u/size", cpu, index);
+            const auto bytes = NumberFromFile(path);
+            if (cpus == 0) break;
+            auto found = std::find_if(facts.domains.begin(), facts.domains.end(), [&](const CacheDomain& domain) { return domain.cpus == cpus; });
+            if (found == facts.domains.end()) found = facts.domains.insert(facts.domains.end(), CacheDomain{cpus, bytes, 0});
+            found->bestRank = std::max(found->bestRank, rank);
+            break;
+        }
+    }
+    return facts;
+}
+#endif
+
+inline const DomainPlacement& ProcessCacheDomain() {
+    static const DomainPlacement placement = [] {
+#ifdef __linux__
+        if (std::getenv("APS5_NO_CACHE_DOMAIN") != nullptr) return DomainPlacement{};
+        if (MaskFromEnvironment("APS5_WORKER_AFFINITY_MASK") != 0 || MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK") != 0) return DomainPlacement{};
+        return ChooseCacheDomain(ReadCpuFacts());
+#else
+        return DomainPlacement{};
+#endif
+    }();
+    return placement;
 }
 
 }
