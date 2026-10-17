@@ -91,10 +91,27 @@ class CommitReclaim {
 public:
     void Release(DrawPipeline::Commit commit) {
         if (!commit) return;
-        std::lock_guard lock(mutex);
-        if (!thread.joinable()) thread = std::thread([this] { run(); });
-        released.push_back(std::move(commit));
-        if (released.size() == 32) ready.notify_one();
+        {
+            std::lock_guard lock(mutex);
+            if (!stopped) {
+                if (!thread.joinable()) thread = std::thread([this] { run(); });
+                released.push_back(std::move(commit));
+                if (released.size() == 32) ready.notify_one();
+                return;
+            }
+        }
+        commit = nullptr;
+    }
+
+    void Stop() {
+        std::deque<DrawPipeline::Commit> taken;
+        {
+            std::unique_lock lock(mutex);
+            stopped = true;
+            idle.wait(lock, [&] { return !clearing; });
+            taken.swap(released);
+        }
+        taken.clear();
     }
 
 private:
@@ -105,13 +122,23 @@ private:
                 std::unique_lock lock(mutex);
                 ready.wait_for(lock, std::chrono::milliseconds(2), [&] { return released.size() >= 32; });
                 batch.swap(released);
+                clearing = !batch.empty();
             }
+            if (batch.empty()) continue;
             batch.clear();
+            {
+                std::lock_guard lock(mutex);
+                clearing = false;
+            }
+            idle.notify_all();
         }
     }
     std::mutex mutex;
     std::condition_variable ready;
+    std::condition_variable idle;
     std::deque<DrawPipeline::Commit> released;
+    bool clearing = false;
+    bool stopped = false;
     std::thread thread;
 };
 
@@ -125,6 +152,10 @@ bool ReclaimCommits() {
     return enabled;
 }
 
+}
+
+void DrawPipeline::StopReclaim() {
+    commitReclaim().Stop();
 }
 
 DrawPipeline& DrawPipeline::Queue0() {

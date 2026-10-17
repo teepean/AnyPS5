@@ -40,6 +40,7 @@ public:
     static std::size_t QueuedItems();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
+    static void StopReclaim();
     static void FollowEpoch(std::uint64_t token);
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
