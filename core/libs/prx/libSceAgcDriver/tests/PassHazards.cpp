@@ -236,6 +236,18 @@ void testWriteOnly() {
     hazards.Add(unknownRead.View());
     Expect(hazards.Check(feedback.View(), true) == PassHazard::UnknownRead, "write-only stores after unknown reads");
     hazards.Clear();
+    hazards.BeginPass();
+    hazards.Add(feedback.View());
+    hazards.SealWriteOnly();
+    Expect(hazards.Check(feedback.View(), true) == PassHazard::WriteAfterWrite, "write-only stores over stores sealed by a flush");
+    Use afterSeal;
+    afterSeal.writeOnly = {{0x9000, 0xa000}};
+    Expect(hazards.Check(afterSeal.View(), true) == PassHazard::None, "write-only stores elsewhere after a seal");
+    hazards.Add(afterSeal.View());
+    Expect(hazards.Check(afterSeal.View(), true) == PassHazard::None, "write-only stores after a seal continue the pass among themselves");
+    hazards.Clear();
+    Expect(hazards.Check(feedback.View(), true) == PassHazard::None, "a cleared seal");
+    hazards.Clear();
     hazards.Add(feedback.View());
     Expect(!hazards.Empty(), "write-only stores are tracked");
     hazards.Clear();

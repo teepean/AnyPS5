@@ -33,6 +33,7 @@ public:
     bool Overlaps(std::uint64_t begin, std::uint64_t end) const;
     bool Empty() const { return ranges.empty(); }
     std::size_t Size() const { return ranges.size(); }
+    GuestRangeList Ranges() const { return ranges; }
     void Clear() { ranges.clear(); }
 
 private:
@@ -44,6 +45,7 @@ public:
     PassHazard Check(const PassAccess& access, bool samePass) const;
     void Add(const PassAccess& access);
     void BeginPass() { ++pass; }
+    void SealWriteOnly();
     void Clear();
     bool Empty() const;
 

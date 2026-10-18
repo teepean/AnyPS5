@@ -78,6 +78,11 @@ void PassHazards::Add(const PassAccess& access) {
     anyWrites = anyWrites || access.anyWrites;
 }
 
+void PassHazards::SealWriteOnly() {
+    for (const auto& [begin, end] : writeOnly.Ranges()) writes.Insert(begin, end);
+    writeOnly.Clear();
+}
+
 void PassHazards::Clear() {
     reads.Clear();
     writes.Clear();
