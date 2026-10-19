@@ -372,6 +372,8 @@ struct DrawOutcome {
     bool repeatedTemplate = false;
     bool repeatedPipeline = false;
     bool repeatedBinding = false;
+    bool keptTargets = false;
+    bool targetMemoWrong = false;
     // Resident target lookups, and those that took a millisecond or more. Whether a slow one
     // re-uploaded the image or just walked its pages under contention is not visible from here
     // (StorageTexture::Version advances on every MarkDirty as well as on an upload, and Generation
@@ -437,7 +439,7 @@ struct DrawProfile {
     // Render passes recorded draws began, and draws that continued the previous draw's pass.
     std::uint64_t passesBegun = 0;
     std::uint64_t passesContinued = 0;
-    std::array<std::uint64_t, 5> repeatPath{};
+    std::array<std::uint64_t, 7> repeatPath{};
     std::array<DrawPassCounts, 2> passTotals{};
     std::array<std::uint64_t, SyncCount> reasons{};
     // The CPU inside Graphics::Draw, split by outcome: a synchronous draw costs ten times a recorded
@@ -514,6 +516,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.repeatedTemplate) ++profile.repeatPath[2];
     if (outcome.repeatedPipeline) ++profile.repeatPath[3];
     if (outcome.repeatedBinding) ++profile.repeatPath[4];
+    if (outcome.keptTargets) ++profile.repeatPath[5];
+    if (outcome.targetMemoWrong) ++profile.repeatPath[6];
     if (outcome.recorded) {
         auto& totals = profile.passTotals[outcome.addressDraw ? 1 : 0];
         ++totals.draws;
@@ -554,7 +558,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
-    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; repeat path: hinted %llu, targets %llu, templates %llu, pipelines %llu, state kept %llu", static_cast<unsigned long long>(profile.repeatPath[0]), static_cast<unsigned long long>(profile.repeatPath[1]), static_cast<unsigned long long>(profile.repeatPath[2]), static_cast<unsigned long long>(profile.repeatPath[3]), static_cast<unsigned long long>(profile.repeatPath[4]));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; repeat path: hinted %llu, targets %llu, templates %llu, pipelines %llu, state kept %llu; targets kept %llu (verify wrong %llu)", static_cast<unsigned long long>(profile.repeatPath[0]), static_cast<unsigned long long>(profile.repeatPath[1]), static_cast<unsigned long long>(profile.repeatPath[2]), static_cast<unsigned long long>(profile.repeatPath[3]), static_cast<unsigned long long>(profile.repeatPath[4]), static_cast<unsigned long long>(profile.repeatPath[5]), static_cast<unsigned long long>(profile.repeatPath[6]));
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.0f (%llu)", DrawKindNames[kind], average(profile.kindUs[kind], profile.kindCounts[kind]), static_cast<unsigned long long>(profile.kindCounts[kind]));
@@ -1428,11 +1432,76 @@ struct RepeatedDraw {
     std::vector<std::weak_ptr<StorageTexture>> owners;
     VertexInputLayout vertexLayout;
     std::uint32_t fragmentOutputs = 0;
+    std::vector<ColorTarget> colors;
+    bool targetsProved = false;
+    std::uint64_t targetGeneration = 0;
+    std::uint64_t targetEpoch = 0;
+    std::uint64_t targetUnwatched = 0;
+    std::uint64_t targetAllocations = 0;
+    std::uint64_t targetDepthSurfaces = 0;
+    std::uint64_t targetPending = 0;
+    std::vector<std::uint64_t> targetVersions;
 };
 
 RepeatedDraw& lastDraw() {
     thread_local RepeatedDraw draw;
     return draw;
+}
+
+bool TargetMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_TARGET_MEMO") != nullptr;
+    return !disabled;
+}
+
+bool VerifyTargetMemo() {
+    static const bool enabled = std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr;
+    return enabled;
+}
+
+bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.slot == b.slot && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.dccControl == b.dccControl;
+}
+
+struct TargetMemoState {
+    std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t allocations = 0;
+    std::uint64_t depthSurfaces = 0;
+    std::uint64_t pending = 0;
+};
+
+TargetMemoState currentTargetMemoState() {
+    return {GuestMemory::TrackerGeneration(), GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), StorageTexture::PendingSerial()};
+}
+
+bool targetMemoHolds(const Context& context, const RepeatedDraw& last, std::span<const ColorTarget> colors, std::vector<std::shared_ptr<StorageTexture>>& owners) {
+    owners.clear();
+    if (last.targetEpoch == 0 || last.targetEpoch != GuestMemory::ThreadCollectEpoch() || last.targetUnwatched != GuestMemory::UnwatchSerial() || last.targetAllocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || last.targetDepthSurfaces != DepthSurfacesSerial() || last.targetPending != StorageTexture::PendingSerial()) return false;
+    if (last.owners.size() != colors.size() || last.targetVersions.size() != colors.size() || last.targetViews.size() < colors.size()) return false;
+    const auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return false;
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    for (std::size_t index = 0; index < colors.size(); ++index) {
+        auto owner = last.owners[index].lock();
+        if (owner == nullptr || !owner->Cached() || owner->Version() != last.targetVersions[index]) return false;
+        const auto& color = colors[index];
+        const auto& own = owner->Descriptor();
+        const auto bytes = static_cast<std::size_t>(owner->GuestBytes());
+        if (bytes == 0 || CompletePendingCpuWrites(context, own.baseAddress, bytes)) return false;
+        queries.push_back({own.baseAddress, bytes, last.targetGeneration});
+        const auto metadata = [&](std::uint64_t address, std::size_t count) {
+            if (address == 0 || count == 0) return true;
+            if (recorder->PendingWriteOverlaps(address, count) || CompletePendingCpuWrites(context, address, count)) return false;
+            queries.push_back({address, count, last.targetGeneration});
+            return true;
+        };
+        if (!metadata(own.dccAddress, DccKeyBytes(owner->GuestBytes())) || !metadata(color.dccAddress, DccKeyBytes(color.bytes)) || !metadata(color.cmaskAddress, color.cmaskBytes)) return false;
+        owners.push_back(std::move(owner));
+    }
+    return GuestMemory::UnchangedSinceAll(queries);
 }
 
 struct RepeatHint {
@@ -2273,11 +2342,23 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             repeatTargets.push_back(std::move(stored));
         }
     }
+    std::vector<std::shared_ptr<StorageTexture>> keptTargets;
+    bool targetsKept = TargetMemoEnabled() && !state.colors.empty() && lastValid && last.targetsProved && last.device == context.device && last.recorder == Recorder::Active() && dumpLimit == 0 && last.colors.size() == state.colors.size() && std::equal(state.colors.begin(), state.colors.end(), last.colors.begin(), sameColorTarget) && targetMemoHolds(context, last, state.colors, keptTargets);
+    const bool verifyTargets = targetsKept && VerifyTargetMemo();
+    if (verifyTargets) targetsKept = false;
+    const auto targetState = TargetMemoEnabled() && !state.colors.empty() && !targetsKept ? currentTargetMemoState() : TargetMemoState{};
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+        if (targetsKept) {
+            binding.resident = keptTargets[index];
+            binding.resident->NoteProved();
+            targetViews.push_back(last.targetViews[index]);
+            timer.phase(PhaseReadTarget);
+            continue;
+        }
         if (repeat) {
             const ColorTargetLayout repeatLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
             RetireDepthSurfaces(context.device, color.address, repeatLayout.Bytes());
@@ -2374,6 +2455,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
+    if (verifyTargets) {
+        bool same = targetViews.size() == state.colors.size();
+        for (std::size_t index = 0; same && index < state.colors.size(); ++index) same = targets[index].resident == keptTargets[index] && targetViews[index] == last.targetViews[index] && keptTargets[index]->Version() == last.targetVersions[index];
+        outcome.targetMemoWrong = !same;
+        static std::atomic<int> reported{0};
+        if (!same && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draws] APS5_VERIFY_TARGET_MEMO: the target memo held but the lookup differs (%zu targets, the first at 0x%llx)\n", state.colors.size(), static_cast<unsigned long long>(state.colors.front().address));
+    }
+    outcome.keptTargets = targetsKept;
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -2617,6 +2706,22 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             last.owners.assign(owners.begin(), owners.end());
             last.vertexLayout = inputs.VertexLayout();
             last.fragmentOutputs = inputs.fragmentOutputs;
+            last.colors.assign(state.colors.begin(), state.colors.end());
+            const bool memoable = TargetMemoEnabled() && !state.colors.empty() && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr && !binding.proxied && !binding.multisampled && binding.color.tileMode != ColorTileMode::Linear && binding.color.samples <= 1; });
+            const bool fresh = targetState.generation != 0 && targetState.epoch != 0;
+            if (memoable && !targetsKept && fresh) {
+                last.targetGeneration = targetState.generation;
+                last.targetEpoch = targetState.epoch;
+                last.targetUnwatched = targetState.unwatched;
+                last.targetAllocations = targetState.allocations;
+                last.targetDepthSurfaces = targetState.depthSurfaces;
+                last.targetPending = targetState.pending;
+            }
+            last.targetsProved = memoable && (targetsKept || fresh);
+            last.targetVersions.clear();
+            if (last.targetsProved) {
+                for (const auto& binding : targets) last.targetVersions.push_back(binding.resident->Version());
+            }
         }
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
