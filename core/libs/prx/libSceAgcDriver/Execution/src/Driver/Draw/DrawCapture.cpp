@@ -134,7 +134,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.capture = capture;
     if (instanceKey != 0) {
         StageInstanceTimed(0.0, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fullStart).count());
-        if (fastResult != nullptr) StageInstanceCompare(program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
+        if (fastResult != nullptr) StageInstanceCompare(instanceKey, program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
         StageInstanceLearn(instanceKey, program.snapshot, program.userData, vertexInfos[i], *capture, stageCapture.regions, stageCapture.compiled);
     }
     if (ShapeCensusEnabled()) ShapeCensusStage(program.binary.codeAddress, program.codeOffset, pushOffset, program.userData, capture, stageCapture.regions, stageCapture.compiled, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - censusStart).count());

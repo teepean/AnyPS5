@@ -40,6 +40,7 @@ struct Patch {
     std::uint32_t binding;
     std::uint32_t word;
     Source source;
+    std::uint32_t confirmations = 0;
 };
 
 struct Entry {
@@ -54,10 +55,13 @@ struct Entry {
     std::vector<bool> userFree;
     std::vector<bool> wordFree;
     bool learned = false;
+    bool blocked = false;
+    bool ready = false;
+    std::uint32_t stable = 0;
 };
 
-enum Miss : std::uint8_t { MissNoEntry, MissNotLearned, MissUser, MissPointerFlags, MissVertex, MissRead, MissWord, MissCount };
-constexpr const char* MissNames[MissCount] = {"no entry", "not learned", "user word", "pointer flags", "vertex", "read", "run word"};
+enum Miss : std::uint8_t { MissNoEntry, MissNotLearned, MissBlocked, MissNotReady, MissUser, MissPointerFlags, MissVertex, MissRead, MissWord, MissCount };
+constexpr const char* MissNames[MissCount] = {"no entry", "not learned", "tables or poison", "not confirmed", "user word", "pointer flags", "vertex", "read", "run word"};
 
 enum LearnFail : std::uint8_t { FailStructure, FailVariant, FailBindings, FailPushSize, FailVertex, FailForwarded, FailNoSource, FailCount };
 constexpr const char* LearnFailNames[FailCount] = {"structure", "variant", "bindings", "push size", "vertex", "forwarded words", "no source"};
@@ -72,6 +76,9 @@ struct Counters {
     std::array<std::uint64_t, FailCount> failed{};
     std::uint64_t compared = 0;
     std::uint64_t mismatched = 0;
+    std::uint64_t mismatchedPatched = 0;
+    std::uint64_t mismatchedUnpatched = 0;
+    std::uint64_t mismatchedShape = 0;
     std::uint64_t regionMismatches = 0;
     std::uint64_t fastTimed = 0;
     double fastUs = 0.0;
@@ -165,6 +172,24 @@ std::uint32_t sourceValue(const Source& source, std::span<const std::uint32_t> u
     return 0;
 }
 
+bool fieldExists(const ShaderRecompiler::RecompileResult& result, const Patch& patch) {
+    if (patch.kind == FieldKind::Binding) return patch.binding < result.bindings.size() && patch.word < result.bindings[patch.binding].guestDescriptor.size();
+    return (static_cast<std::size_t>(patch.word) + 1u) * sizeof(std::uint32_t) <= result.pushConstants.size();
+}
+
+std::uint32_t fieldValue(const ShaderRecompiler::RecompileResult& result, const Patch& patch) {
+    return patch.kind == FieldKind::Binding ? result.bindings[patch.binding].guestDescriptor[patch.word] : pushWord(result, patch.word);
+}
+
+bool sourceExists(const Source& source, std::size_t userWords, std::size_t readWords, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+    switch (source.kind) {
+        case SourceKind::User: return source.index < userWords;
+        case SourceKind::Word: return source.index < readWords;
+        case SourceKind::Vertex: return vertex.has_value() && source.index / 4u < std::min(vertex->resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources);
+    }
+    return false;
+}
+
 struct Candidates {
     std::span<const std::uint32_t> previousUser, currentUser, previousWords, currentWords;
     const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* previousVertex;
@@ -207,27 +232,40 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
         if (was.location != is.location || was.components != is.components || was.formatComponents != is.formatComponents || was.resource.fields[3] != is.resource.fields[3] || (was.resource.fields[1] >> 16u) != (is.resource.fields[1] >> 16u)) return FailVertex;
     }
     const Candidates from{entry.userData, userData, entry.words, words, &entry.vertex, &vertex};
-    std::vector<Patch> patches;
     for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
-        const auto& was = previous.bindings[b];
-        const auto& is = current.bindings[b];
-        if (!sameBindingShape(was, is)) return FailBindings;
-        for (std::uint32_t w = 0; w < is.guestDescriptor.size(); ++w) {
-            if (was.guestDescriptor[w] == is.guestDescriptor[w]) continue;
-            const auto source = findSource(from, was.guestDescriptor[w], is.guestDescriptor[w]);
-            if (!source) return FailNoSource;
-            patches.push_back({FieldKind::Binding, b, w, *source});
-        }
+        if (!sameBindingShape(previous.bindings[b], current.bindings[b])) return FailBindings;
     }
     const auto pushWords = current.pushConstants.size() / sizeof(std::uint32_t);
     if (std::memcmp(previous.pushConstants.data() + pushWords * sizeof(std::uint32_t), current.pushConstants.data() + pushWords * sizeof(std::uint32_t), current.pushConstants.size() - pushWords * sizeof(std::uint32_t)) != 0) return FailPushSize;
+    std::vector<Patch> patches;
+    for (const auto& patch : entry.patches) {
+        if (!fieldExists(previous, patch) || !fieldExists(current, patch) || !sourceExists(patch.source, userData.size(), words.size(), vertex)) continue;
+        if (fieldValue(previous, patch) != sourceValue(patch.source, entry.userData, entry.words, entry.vertex)) continue;
+        if (fieldValue(current, patch) != sourceValue(patch.source, userData, words, vertex)) continue;
+        auto confirmed = patch;
+        ++confirmed.confirmations;
+        patches.push_back(confirmed);
+    }
+    const auto covered = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word) {
+        return std::any_of(patches.begin(), patches.end(), [&](const Patch& patch) { return patch.kind == kind && patch.binding == binding && patch.word == word; });
+    };
+    for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
+        const auto& was = previous.bindings[b];
+        const auto& is = current.bindings[b];
+        for (std::uint32_t w = 0; w < is.guestDescriptor.size(); ++w) {
+            if (was.guestDescriptor[w] == is.guestDescriptor[w] || covered(FieldKind::Binding, b, w)) continue;
+            const auto source = findSource(from, was.guestDescriptor[w], is.guestDescriptor[w]);
+            if (!source) return FailNoSource;
+            patches.push_back({FieldKind::Binding, b, w, *source, 0});
+        }
+    }
     for (std::uint32_t d = 0; d < pushWords; ++d) {
         const auto was = pushWord(previous, d);
         const auto is = pushWord(current, d);
-        if (was == is) continue;
+        if (was == is || covered(FieldKind::Push, 0, d)) continue;
         const auto source = findSource(from, was, is);
         if (!source) return FailNoSource;
-        patches.push_back({FieldKind::Push, 0, d, *source});
+        patches.push_back({FieldKind::Push, 0, d, *source, 0});
     }
     entry.patches = std::move(patches);
     return std::nullopt;
@@ -259,13 +297,19 @@ void store(Entry& entry, const std::shared_ptr<const void>& shader, std::vector<
         }
         if ((reads[r].first & 3u) != 0) drop(reads[r].second);
     }
+    const auto& forwarded = entry.result->shaderDataUserWords;
     for (std::uint32_t u = 0; u < entry.userData.size() && u < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++u) {
-        if ((origins >> u & 1u) != 0 && (entry.use.asBase >> u & 1u) != 0 && (entry.use.asValue >> u & 1u) == 0) entry.userFree[u] = true;
+        const bool base = (entry.use.asBase >> u & 1u) != 0;
+        const bool value = (entry.use.asValue >> u & 1u) != 0;
+        const bool forwards = std::find(forwarded.begin(), forwarded.end(), u) != forwarded.end();
+        if ((origins >> u & 1u) != 0 && base && !value) entry.userFree[u] = true;
+        if (!base && !value && !forwards) entry.userFree[u] = true;
     }
     for (const auto& patch : entry.patches) {
         if (patch.source.kind == SourceKind::User && patch.source.index < entry.userFree.size()) entry.userFree[patch.source.index] = true;
         if (patch.source.kind == SourceKind::Word && patch.source.index < entry.wordFree.size()) entry.wordFree[patch.source.index] = true;
     }
+    entry.ready = entry.learned && !entry.blocked && entry.stable >= 2 && std::all_of(entry.patches.begin(), entry.patches.end(), [](const Patch& patch) { return patch.confirmations >= 1; });
 }
 
 void report(State& value) {
@@ -274,7 +318,7 @@ void report(State& value) {
     value.reported = now;
     auto& c = value.counters;
     std::string line;
-    char piece[200];
+    char piece[400];
     std::snprintf(piece, sizeof(piece), "[stage-instances] (10 s): %llu lookups, %llu hits (%.1f%%; %llu shared the cached result, %.2f words patched per hit); misses:", static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.hits), c.lookups != 0 ? 100.0 * static_cast<double>(c.hits) / static_cast<double>(c.lookups) : 0.0, static_cast<unsigned long long>(c.shared), c.hits != 0 ? static_cast<double>(c.patchedWords) / static_cast<double>(c.hits) : 0.0);
     line += piece;
     for (std::size_t m = 0; m < MissCount; ++m) {
@@ -287,7 +331,7 @@ void report(State& value) {
         std::snprintf(piece, sizeof(piece), " %s %llu", LearnFailNames[f], static_cast<unsigned long long>(c.failed[f]));
         line += piece;
     }
-    std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions; fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
+    std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions (patched %llu, unpatched %llu, shape %llu); fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), static_cast<unsigned long long>(c.mismatchedPatched), static_cast<unsigned long long>(c.mismatchedUnpatched), static_cast<unsigned long long>(c.mismatchedShape), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
     line += piece;
     std::fprintf(stderr, "%s\n", line.c_str());
     c = Counters{};
@@ -375,7 +419,9 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     };
     if (held == nullptr) return missed(MissNoEntry);
     const auto& entry = *held;
+    if (entry.blocked) return missed(MissBlocked);
     if (!entry.learned) return missed(MissNotLearned);
+    if (!entry.ready) return missed(MissNotReady);
     if (entry.userData.size() != userData.size()) return missed(MissUser);
     for (std::size_t u = 0; u < userData.size(); ++u) {
         if (!entry.userFree[u] && userData[u] != entry.userData[u]) return missed(MissUser);
@@ -387,7 +433,9 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
         if (now == 0 || ((now ^ was) & 3u) != 0) return missed(MissPointerFlags);
     }
     if (entry.vertex.has_value() != vertex.has_value() || (vertex.has_value() && vertex->resourcesNum != entry.vertex->resourcesNum)) return missed(MissVertex);
-    std::vector<std::uint32_t> words(entry.words.size());
+    thread_local std::vector<std::uint32_t> scratch;
+    scratch.assign(entry.words.size(), 0u);
+    auto& words = scratch;
     for (const auto& run : entry.runs) {
         const auto address = run.origin >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(run.origin)])) + run.at : run.at;
         if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return missed(MissRead);
@@ -450,8 +498,11 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
         *entry = *previous;
         failure = learn(*entry, runs, words, userData, vertex, *compiled);
         entry->learned = !failure.has_value();
+        entry->stable = failure ? 0u : previous->stable + 1u;
         if (failure) entry->patches.clear();
     }
+    const auto& snapshot = capture.snapshot;
+    entry->blocked = !snapshot.tables.tables.empty() || !snapshot.tables.ranges.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0;
     store(*entry, shader, std::move(runs), std::move(words), userData, vertex, capture.userDataUse, compiled);
     std::lock_guard lock(value.mutex);
     if (previous != nullptr && previous->result != nullptr && previous->shader == shader) {
@@ -461,21 +512,61 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
     value.entries[key] = std::move(entry);
 }
 
-void StageInstanceCompare(std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
-    bool same = fast.PipelineVariantId() == full.PipelineVariantId() && fast.bindings.size() == full.bindings.size() && fast.pushConstants == full.pushConstants && fast.vertexAttributes.size() == full.vertexAttributes.size();
-    const char* what = same ? "" : "variant, binding count, push constants or attribute count";
-    for (std::size_t b = 0; same && b < full.bindings.size(); ++b) {
-        if (!sameBindingShape(fast.bindings[b], full.bindings[b]) || fast.bindings[b].guestDescriptor != full.bindings[b].guestDescriptor) {
-            same = false;
-            what = "binding";
+void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
+    auto& value = state();
+    std::shared_ptr<const Entry> held;
+    {
+        std::lock_guard lock(value.mutex);
+        const auto found = value.entries.find(key);
+        if (found != value.entries.end()) held = found->second;
+    }
+    const auto patchFor = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word) -> const Patch* {
+        if (held == nullptr) return nullptr;
+        for (const auto& patch : held->patches) {
+            if (patch.kind == kind && patch.binding == binding && patch.word == word) return &patch;
+        }
+        return nullptr;
+    };
+    enum class Kind { Same, Shape, Patched, Unpatched, Attribute };
+    Kind kind = Kind::Same;
+    char detail[240] = "";
+    if (fast.PipelineVariantId() != full.PipelineVariantId() || fast.bindings.size() != full.bindings.size() || fast.pushConstants.size() != full.pushConstants.size() || fast.vertexAttributes.size() != full.vertexAttributes.size()) {
+        kind = Kind::Shape;
+        std::snprintf(detail, sizeof(detail), "shape: variant 0x%llx / 0x%llx, bindings %zu / %zu, push %zu / %zu", static_cast<unsigned long long>(fast.PipelineVariantId()), static_cast<unsigned long long>(full.PipelineVariantId()), fast.bindings.size(), full.bindings.size(), fast.pushConstants.size(), full.pushConstants.size());
+    }
+    for (std::uint32_t b = 0; kind == Kind::Same && b < full.bindings.size(); ++b) {
+        const auto& x = fast.bindings[b];
+        const auto& y = full.bindings[b];
+        if (!sameBindingShape(x, y)) {
+            kind = Kind::Shape;
+            std::snprintf(detail, sizeof(detail), "binding %u shape (role %u)", b, static_cast<unsigned>(y.role));
+            break;
+        }
+        for (std::uint32_t w = 0; w < y.guestDescriptor.size(); ++w) {
+            if (x.guestDescriptor[w] == y.guestDescriptor[w]) continue;
+            const auto* patch = patchFor(FieldKind::Binding, b, w);
+            kind = patch != nullptr ? Kind::Patched : Kind::Unpatched;
+            std::snprintf(detail, sizeof(detail), "binding %u (role %u, count %u) word %u: fast 0x%08x full 0x%08x, %s", b, static_cast<unsigned>(y.role), y.count, w, x.guestDescriptor[w], y.guestDescriptor[w], patch == nullptr ? "not patched" : patch->source.kind == SourceKind::User ? "patched from a user word" : patch->source.kind == SourceKind::Word ? "patched from a read word" : "patched from a vertex word");
+            break;
         }
     }
-    for (std::size_t a = 0; same && a < full.vertexAttributes.size(); ++a) {
+    const auto pushWords = full.pushConstants.size() / sizeof(std::uint32_t);
+    for (std::uint32_t d = 0; kind == Kind::Same && d < pushWords; ++d) {
+        if (pushWord(fast, d) == pushWord(full, d)) continue;
+        const auto* patch = patchFor(FieldKind::Push, 0, d);
+        kind = patch != nullptr ? Kind::Patched : Kind::Unpatched;
+        std::snprintf(detail, sizeof(detail), "push word %u: fast 0x%08x full 0x%08x, %s", d, pushWord(fast, d), pushWord(full, d), patch == nullptr ? "not patched" : "patched");
+    }
+    if (kind == Kind::Same && fast.pushConstants != full.pushConstants) {
+        kind = Kind::Unpatched;
+        std::snprintf(detail, sizeof(detail), "push tail bytes");
+    }
+    for (std::size_t a = 0; kind == Kind::Same && a < full.vertexAttributes.size(); ++a) {
         const auto& x = fast.vertexAttributes[a];
         const auto& y = full.vertexAttributes[a];
         if (x.location != y.location || x.components != y.components || x.resource.fields != y.resource.fields || x.fetchIndex != y.fetchIndex || x.formatComponents != y.formatComponents) {
-            same = false;
-            what = "vertex attribute";
+            kind = Kind::Attribute;
+            std::snprintf(detail, sizeof(detail), "vertex attribute %zu (location %u)", a, y.location);
         }
     }
     const auto flatten = [](std::span<const ShaderRecompiler::MemoryRegion> regions) {
@@ -492,13 +583,18 @@ void StageInstanceCompare(std::uint64_t codeAddress, const ShaderRecompiler::Rec
         return flat;
     };
     const bool sameRegions = flatten(fastRegions) == flatten(fullRegions);
-    auto& value = state();
-    std::lock_guard lock(value.mutex);
-    ++value.counters.compared;
-    if (!same) ++value.counters.mismatched;
-    if (!sameRegions) ++value.counters.regionMismatches;
+    {
+        std::lock_guard lock(value.mutex);
+        auto& c = value.counters;
+        ++c.compared;
+        if (kind != Kind::Same) ++c.mismatched;
+        if (kind == Kind::Patched) ++c.mismatchedPatched;
+        if (kind == Kind::Unpatched || kind == Kind::Attribute) ++c.mismatchedUnpatched;
+        if (kind == Kind::Shape) ++c.mismatchedShape;
+        if (!sameRegions) ++c.regionMismatches;
+    }
     static std::atomic<int> shown{0};
-    if ((!same || !sameRegions) && shown.fetch_add(1) < 12) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx fast result differs (%s%s)\n", static_cast<unsigned long long>(codeAddress), same ? "result equal" : what, sameRegions ? ", regions equal" : ", regions differ");
+    if ((kind != Kind::Same || !sameRegions) && shown.fetch_add(1) < 40) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx: %s%s (entry stable %u, %zu patches)\n", static_cast<unsigned long long>(codeAddress), kind == Kind::Same ? "result equal" : detail, sameRegions ? "" : "; regions differ", held != nullptr ? held->stable : 0u, held != nullptr ? held->patches.size() : 0u);
 }
 
 void StageInstanceTimed(double fastMicroseconds, double fullMicroseconds) {
