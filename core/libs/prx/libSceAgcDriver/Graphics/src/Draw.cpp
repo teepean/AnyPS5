@@ -371,6 +371,7 @@ struct DrawOutcome {
     bool repeatedTargets = false;
     bool repeatedTemplate = false;
     bool repeatedPipeline = false;
+    bool repeatedBinding = false;
     // Resident target lookups, and those that took a millisecond or more. Whether a slow one
     // re-uploaded the image or just walked its pages under contention is not visible from here
     // (StorageTexture::Version advances on every MarkDirty as well as on an upload, and Generation
@@ -436,7 +437,7 @@ struct DrawProfile {
     // Render passes recorded draws began, and draws that continued the previous draw's pass.
     std::uint64_t passesBegun = 0;
     std::uint64_t passesContinued = 0;
-    std::array<std::uint64_t, 4> repeatPath{};
+    std::array<std::uint64_t, 5> repeatPath{};
     std::array<DrawPassCounts, 2> passTotals{};
     std::array<std::uint64_t, SyncCount> reasons{};
     // The CPU inside Graphics::Draw, split by outcome: a synchronous draw costs ten times a recorded
@@ -512,6 +513,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.repeatedTargets) ++profile.repeatPath[1];
     if (outcome.repeatedTemplate) ++profile.repeatPath[2];
     if (outcome.repeatedPipeline) ++profile.repeatPath[3];
+    if (outcome.repeatedBinding) ++profile.repeatPath[4];
     if (outcome.recorded) {
         auto& totals = profile.passTotals[outcome.addressDraw ? 1 : 0];
         ++totals.draws;
@@ -552,7 +554,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
-    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; repeat path: hinted %llu, targets %llu, templates %llu, pipelines %llu", static_cast<unsigned long long>(profile.repeatPath[0]), static_cast<unsigned long long>(profile.repeatPath[1]), static_cast<unsigned long long>(profile.repeatPath[2]), static_cast<unsigned long long>(profile.repeatPath[3]));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; repeat path: hinted %llu, targets %llu, templates %llu, pipelines %llu, state kept %llu", static_cast<unsigned long long>(profile.repeatPath[0]), static_cast<unsigned long long>(profile.repeatPath[1]), static_cast<unsigned long long>(profile.repeatPath[2]), static_cast<unsigned long long>(profile.repeatPath[3]), static_cast<unsigned long long>(profile.repeatPath[4]));
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.0f (%llu)", DrawKindNames[kind], average(profile.kindUs[kind], profile.kindCounts[kind]), static_cast<unsigned long long>(profile.kindCounts[kind]));
@@ -1414,6 +1416,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 struct RepeatedDraw {
     bool valid = false;
     std::uint64_t sequence = 0;
+    std::uint64_t chain = 0;
     VkDevice device = VK_NULL_HANDLE;
     const Recorder* recorder = nullptr;
     ResourceCache::Key key;
@@ -1774,6 +1777,7 @@ struct RecordedDraw {
     const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr;
     VkShaderStageFlags pushStages = 0;
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
+    std::uint64_t stateChain = 0;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -2049,8 +2053,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    const Recorder::GraphicsBinding binding{recorder->Submissions(), record.pipeline->BoundHandle(), record.stateChain};
     if (continued) {
-        record.pipeline->Continue(commands, state);
+        if (record.stateChain == 0 || recorder->BoundGraphics() != binding) record.pipeline->Continue(commands, state);
+        else outcome.repeatedBinding = true;
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -2102,6 +2108,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    recorder->SetBoundGraphics(record.stateChain == 0 || !record.stencilReplay.empty() || record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel() ? Recorder::GraphicsBinding{} : binding);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -2219,6 +2226,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool lastValid = std::exchange(last.valid, false);
     const auto hint = std::exchange(drawRepeatHint, RepeatHint{});
     outcome.repeatHinted = hint.repeatOf != 0;
+    const std::uint64_t chain = hint.sequence == 0 ? 0 : outcome.repeatHinted && lastValid && hint.repeatOf == last.sequence ? last.chain : hint.sequence;
     bool repeat = outcome.repeatHinted && lastValid && hint.repeatOf == last.sequence && last.device == context.device && last.recorder == Recorder::Active() && stencilReferences.empty() && !state.quadList && !draw.indirect && last.owners.size() == state.colors.size() && DumpTargetLimit() == 0;
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
     if (inputs.nothing) return;
@@ -2592,10 +2600,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         record.stencilReplay = stencilReplay;
+        record.stateChain = chain;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
         if (hint.sequence != 0 && !outcome.waited && args == nullptr && stencilReplay.empty() && !multisampled && cacheable && resources->Reusable() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.resident == nullptr; })) {
             last.valid = true;
             last.sequence = hint.sequence;
+            last.chain = chain;
             last.device = context.device;
             last.recorder = recorder;
             last.key.assign(contentKey.begin(), contentKey.end());
@@ -2732,6 +2742,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         imageBarrier(context, commands, binding.target->Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     }
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+    if (recorded) recorder->SetBoundGraphics({});
     pipeline->Begin(commands, *framebuffer, state.renderExtent, state);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());

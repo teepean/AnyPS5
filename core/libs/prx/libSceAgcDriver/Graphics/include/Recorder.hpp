@@ -68,6 +68,14 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    struct GraphicsBinding {
+        std::uint64_t batch = 0;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::uint64_t chain = 0;
+        bool operator==(const GraphicsBinding&) const = default;
+    };
+    const GraphicsBinding& BoundGraphics() const { return boundGraphics; }
+    void SetBoundGraphics(const GraphicsBinding& binding) { boundGraphics = binding; }
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -831,6 +839,7 @@ private:
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    GraphicsBinding boundGraphics;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;

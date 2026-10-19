@@ -749,6 +749,11 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     Continue(commands, state);
 }
 
+VkPipeline Pipeline::BoundHandle() const {
+    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    return best != VK_NULL_HANDLE ? best : pipeline;
+}
+
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
