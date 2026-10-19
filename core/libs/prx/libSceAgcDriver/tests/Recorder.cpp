@@ -6392,7 +6392,32 @@ void queuedWriteGroupTests() {
         }
         return memory;
     };
+    const auto recorded = [](const std::vector<Write>& writes) {
+        const auto order = Recorder::QueuedWriteOrder(writes);
+        std::vector<Write> ordered;
+        for (const auto index : order) ordered.push_back(writes[index]);
+        const auto groups = Recorder::QueuedWriteGroups(ordered);
+        std::vector<std::size_t> sequence;
+        std::size_t first = 0;
+        for (const auto end : groups) {
+            for (const bool computed : {false, true}) {
+                for (auto i = first; i < end; ++i) {
+                    if (ordered[i].computed == computed) sequence.push_back(order[i]);
+                }
+            }
+            first = end;
+        }
+        return std::pair{sequence, groups.size()};
+    };
     Require(Recorder::QueuedWriteGroups({}).empty(), "no queued writes made a group");
+    const std::vector<Write> flagged{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x200, 0x208, false}, {0x400, 0x500, false}, {0x400, 0x4f8, true}, {0x408, 0x500, true}, {0x500, 0x508, false}, {0x800, 0x804, false}};
+    Require(recorded(flagged) == std::pair{std::vector<std::size_t>{0, 4, 1, 2, 5, 6, 3, 7, 8}, std::size_t{2}}, "the dumps of a run with a flag after each query slot were not folded once, with the clears before them and the flags after them");
+    const std::vector<Write> open{{0x50, 0x58, false}, {0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x200, 0x208, false}, {0x400, 0x500, false}, {0x400, 0x4f8, true}};
+    Require(recorded(open) == std::pair{std::vector<std::size_t>{0, 1, 5, 2, 3, 6, 4}, std::size_t{2}}, "the clear of a slot whose end dump the run does not hold was not moved ahead of the dumps");
+    const std::vector<Write> overDump{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x1f0, 0x410, false}, {0x400, 0x4f8, true}};
+    Require(Recorder::QueuedWriteOrder(overDump) == std::vector<std::size_t>{0, 1, 2, 3, 4}, "a store over an earlier dump that the later dumps cover only in part was moved ahead of that dump");
+    const std::vector<Write> overFlag{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x500, 0x508, false}, {0x400, 0x508, false}, {0x400, 0x4f8, true}, {0x408, 0x500, true}};
+    Require(Recorder::QueuedWriteOrder(overFlag) == std::vector<std::size_t>{0, 1, 2, 3, 4, 5, 6}, "a clear over an earlier store after a dump was moved ahead of that store");
     const std::vector<Write> query{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x200, 0x300, false}, {0x200, 0x2f8, true}, {0x208, 0x300, true}};
     Require(Recorder::QueuedWriteGroups(query) == Groups{3, 6}, "the clear of the next query slot did not wait for the dumps before it");
     const std::vector<Write> reused{{0x100, 0x1f8, true}, {0x100, 0x200, false}, {0x100, 0x1f8, true}};
@@ -6422,6 +6447,26 @@ void queuedWriteGroupTests() {
         const auto groups = Recorder::QueuedWriteGroups(writes);
         Require(!groups.empty() && groups.back() == writes.size() && std::is_sorted(groups.begin(), groups.end()), "queued write groups do not end at the last write in order");
         Require(paint(writes, groups, bytes) == programOrder(writes, bytes), "recording each group's stores before its computed writes changed the final bytes of the program order");
+        const auto sequence = recorded(writes).first;
+        std::vector<std::size_t> position(writes.size(), writes.size());
+        for (std::size_t i = 0; i < sequence.size(); ++i) position[sequence[i]] = i;
+        Require(sequence.size() == writes.size() && std::find(position.begin(), position.end(), writes.size()) == position.end(), "the recorded order is not a permutation of the queued writes");
+        std::vector<std::uint8_t> memory(bytes, 0);
+        for (const auto index : sequence) {
+            for (auto at = writes[index].begin; at < writes[index].end; ++at) memory[at] = static_cast<std::uint8_t>(index + 1);
+        }
+        Require(memory == programOrder(writes, bytes), "the recorded order changed the final bytes of the program order");
+        for (std::size_t j = 0; j < writes.size(); ++j) {
+            if (writes[j].computed) continue;
+            std::vector<bool> covered(bytes);
+            for (auto k = j + 1; k < writes.size(); ++k) {
+                if (writes[k].computed) std::fill(covered.begin() + writes[k].begin, covered.begin() + writes[k].end, true);
+            }
+            if (std::any_of(covered.begin() + writes[j].begin, covered.begin() + writes[j].end, [](bool value) { return value; })) continue;
+            for (std::size_t i = 0; i < j; ++i) {
+                Require(position[i] < position[j], writes[i].computed ? "a store no later dump overlaps was recorded before a dump ahead of it" : "a store no later dump overlaps was recorded before a store ahead of it");
+            }
+        }
     }
 }
 

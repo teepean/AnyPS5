@@ -1670,6 +1670,18 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         std::vector<QueuedWrite> writes;
         writes.reserve(stores.size());
         for (const auto& store : stores) writes.push_back({store.address, store.End(), store.dumpTarget != 0});
+        if (const auto order = QueuedWriteOrder(writes); !std::is_sorted(order.begin(), order.end())) {
+            std::vector<Batch::StoreRun::Queued> ordered;
+            std::vector<QueuedWrite> orderedWrites;
+            ordered.reserve(stores.size());
+            orderedWrites.reserve(writes.size());
+            for (const auto index : order) {
+                ordered.push_back(std::move(stores[index]));
+                orderedWrites.push_back(writes[index]);
+            }
+            stores = std::move(ordered);
+            writes = std::move(orderedWrites);
+        }
         const bool dumps = std::any_of(writes.begin(), writes.end(), [](const QueuedWrite& write) { return write.computed; });
         if (dumps) recordQueuedDumps(commands, stores);
         std::size_t first = 0;
@@ -2117,6 +2129,56 @@ bool Recorder::gpuSampleCounter() {
 
 std::uint64_t Recorder::Batch::StoreRun::Queued::End() const {
     return address + (dumpTarget != 0 ? SampleDumpBytes : bytes.size());
+}
+
+std::vector<std::size_t> Recorder::QueuedWriteOrder(std::span<const QueuedWrite> writes) {
+    std::vector<std::size_t> order(writes.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::vector<bool> coveredLater(writes.size()), overLater(writes.size());
+    std::map<std::uint64_t, std::uint64_t> later;
+    for (auto i = writes.size(); i-- > 0;) {
+        const auto& write = writes[i];
+        if (!write.computed) {
+            const auto after = later.upper_bound(write.begin);
+            coveredLater[i] = after != later.begin() && std::prev(after)->second >= write.end;
+            const auto last = later.lower_bound(write.end);
+            overLater[i] = last != later.begin() && std::prev(last)->second > write.begin;
+            continue;
+        }
+        auto begin = write.begin, end = write.end;
+        auto at = later.lower_bound(begin);
+        if (at != later.begin() && std::prev(at)->second >= begin) --at;
+        while (at != later.end() && at->first <= end) {
+            begin = std::min(begin, at->first);
+            end = std::max(end, at->second);
+            at = later.erase(at);
+        }
+        later.emplace(begin, end);
+    }
+    std::vector<std::size_t> before, dumps, after;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> earlier, delayed;
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        const auto& write = writes[i];
+        const auto over = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return write.begin < range.second && range.first < write.end; });
+        };
+        if (write.computed) {
+            dumps.push_back(i);
+            earlier.emplace_back(write.begin, write.end);
+        } else if (dumps.empty()) {
+            before.push_back(i);
+        } else if (overLater[i]) {
+            if (over(delayed) || (!coveredLater[i] && over(earlier))) return order;
+            before.push_back(i);
+        } else {
+            after.push_back(i);
+            delayed.emplace_back(write.begin, write.end);
+        }
+    }
+    order = std::move(before);
+    order.insert(order.end(), dumps.begin(), dumps.end());
+    order.insert(order.end(), after.begin(), after.end());
+    return order;
 }
 
 std::vector<std::size_t> Recorder::QueuedWriteGroups(std::span<const QueuedWrite> writes) {

@@ -231,6 +231,7 @@ public:
         std::uint64_t end;
         bool computed;
     };
+    static std::vector<std::size_t> QueuedWriteOrder(std::span<const QueuedWrite> writes);
     static std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes);
     // Waits only for the batches up to the newest one that writes the range (submitting the open
     // batch when it is that one); later batches stay in flight. Fences of one queue signal in
