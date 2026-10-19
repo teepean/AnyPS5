@@ -539,6 +539,22 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    struct ProofMemo {
+        bool valid = false;
+        std::uint64_t generation = 0;
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t depthSurfaces = 0;
+        std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        std::vector<std::pair<std::uint64_t, std::size_t>> keyRanges;
+        std::vector<std::pair<const StorageTexture*, std::uint64_t>> images;
+    };
+    bool revalidate(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool completeCpuWrites();
+    std::size_t proofMemoMiss() const;
+    void takeProofMemo(const ProofMemo& before);
+    bool finishProofMemoHit();
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
@@ -638,6 +654,7 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    ProofMemo proofMemo;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();

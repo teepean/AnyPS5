@@ -2652,8 +2652,24 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    std::array<std::atomic<std::uint64_t>, 10> memo{};
+    std::atomic<std::uint64_t> memoTaken{0};
+    std::atomic<std::uint64_t> memoVerified{0};
+    std::atomic<std::uint64_t> memoWrong{0};
     std::atomic<std::int64_t> lastReport{0};
 };
+
+constexpr std::array<const char*, 10> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges"};
+
+bool ProofMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_PROOF_MEMO") != nullptr;
+    return !disabled;
+}
+
+bool VerifyProofMemo() {
+    static const bool enabled = std::getenv("APS5_VERIFY_PROOF_MEMO") != nullptr;
+    return enabled;
+}
 
 RevalidateProfile& Revalidations() {
     static RevalidateProfile profile;
@@ -2740,6 +2756,8 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
+    const auto memo = byReason(profile.memo, ProofMemoNames);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] proof memo (10 s):%s; taken %llu, verified %llu, wrong %llu\n", memo.c_str(), static_cast<unsigned long long>(profile.memoTaken.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.memoVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.memoWrong.exchange(0, std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)));
 }
 
@@ -3129,22 +3147,140 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
     return nullptr;
 }
 
+bool ShaderResources::completeCpuWrites() {
+    if (!AnyPendingCpuWrites(context)) return false;
+    bool synced = false;
+    for (const auto& region : directRegions) synced |= CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    for (const auto& range : describedRanges) {
+        synced |= CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+        if (range.dccAddress != 0) synced |= CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        synced |= CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        if (image->Descriptor().dccAddress != 0) synced |= CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    return synced;
+}
+
+std::size_t ShaderResources::proofMemoMiss() const {
+    const auto& memo = proofMemo;
+    if (!memo.valid) return 1;
+    if (memo.epoch == 0 || memo.epoch != GuestMemory::ThreadCollectEpoch()) return 3;
+    if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || memo.depthSurfaces != DepthSurfacesSerial()) return 4;
+    if (pendingSerialSeen == 0 || pendingSerialSeen != StorageTexture::PendingSerial()) return 5;
+    for (const auto& [image, version] : memo.images) {
+        if (!image->Cached() || image->Version() != version) return 6;
+    }
+    if (!memo.keyRanges.empty()) {
+        const auto* recorder = Recorder::Active();
+        if (recorder == nullptr) return 7;
+        for (const auto& [address, bytes] : memo.keyRanges) {
+            if (recorder->PendingWriteOverlaps(address, bytes)) return 7;
+        }
+    }
+    if (!directRegions.empty() && !HostImportsUnchanged(context, importsProof)) return 8;
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    for (const auto& [address, bytes] : memo.ranges) queries.push_back({address, bytes, memo.generation});
+    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return 9;
+    return 0;
+}
+
+void ShaderResources::takeProofMemo(const ProofMemo& before) {
+    auto& memo = proofMemo;
+    memo.valid = false;
+    memo.ranges.clear();
+    memo.keyRanges.clear();
+    memo.images.clear();
+    if (before.generation == 0 || before.epoch == 0 || validatedTextures.size() != textures.size()) return;
+    const auto addSurface = [&](std::uint64_t address, std::uint64_t bytes, std::uint64_t dccAddress) {
+        if (bytes == 0) return;
+        if (address != 0) memo.ranges.emplace_back(address, static_cast<std::size_t>(bytes));
+        const auto keys = DccKeyBytes(bytes);
+        if (dccAddress == 0 || keys == 0) return;
+        memo.ranges.emplace_back(dccAddress, keys);
+        memo.keyRanges.emplace_back(dccAddress, keys);
+    };
+    for (const auto& surface : validatedTextures) {
+        if (!surface.valid || surface.depth) return;
+        addSurface(surface.resource.baseAddress, surface.bytes, surface.resource.dccAddress);
+        if (surface.source == nullptr) continue;
+        const auto& own = surface.source->Descriptor();
+        addSurface(own.baseAddress, surface.source->GuestBytes(), own.dccAddress);
+        memo.images.emplace_back(surface.source, surface.source->Version());
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr) return;
+        const auto& own = image->Descriptor();
+        addSurface(own.baseAddress, image->GuestBytes(), own.dccAddress);
+        if (i < storageKeys.size() && storageKeys[i] != 0 && storageKeys[i] != own.dccAddress) addSurface(0, image->GuestBytes(), storageKeys[i]);
+        memo.images.emplace_back(image, image->Version());
+    }
+    memo.generation = before.generation;
+    memo.epoch = before.epoch;
+    memo.unwatched = before.unwatched;
+    memo.allocations = before.allocations;
+    memo.depthSurfaces = before.depthSurfaces;
+    memo.valid = true;
+    if (BuildProfiled()) Revalidations().memoTaken.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ShaderResources::finishProofMemoHit() {
+    for (const auto& [image, version] : proofMemo.images) image->NoteProved();
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        try {
+            guestMemory.RecordStagingCopies(*recorder);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
+            return false;
+        }
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+    }
+    return true;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (!reusable || shaders.empty() || !ProofMemoEnabled() || !EpochRevalidate()) return revalidate(shaders, report);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto miss = proofMemoMiss();
+    if (miss == 0 && completeCpuWrites()) miss = 2;
+    if (profile) Revalidations().memo[miss].fetch_add(1, std::memory_order_relaxed);
+    if (miss == 0 && !VerifyProofMemo()) {
+        if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+        const bool ok = finishProofMemoHit();
+        if (!ok) proofMemo.valid = false;
+        if (profile) countRevalidate(true, ok, start);
+        return ok;
+    }
+    ProofMemo before;
+    before.generation = GuestMemory::TrackerGeneration();
+    before.epoch = GuestMemory::ThreadCollectEpoch();
+    before.unwatched = GuestMemory::UnwatchSerial();
+    before.allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    before.depthSurfaces = DepthSurfacesSerial();
+    proofMemo.valid = false;
+    const bool ok = revalidate(shaders, report);
+    if (miss == 0) {
+        auto& counts = Revalidations();
+        (ok ? counts.memoVerified : counts.memoWrong).fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> reported{0};
+        if (!ok && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOF_MEMO: the memo held but the proof failed (path %zu, failure %zu, %zu textures, %zu storage images)\n", report != nullptr ? static_cast<std::size_t>(report->path) : 0, report != nullptr ? static_cast<std::size_t>(report->failure) : 0, textures.size(), storageTextures.size());
+    }
+    if (ok) takeProofMemo(before);
+    return ok;
+}
+
+bool ShaderResources::revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (AnyPendingCpuWrites(context)) {
-        for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-        for (const auto& range : describedRanges) {
-            CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-            if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
-        }
-        for (const auto& image : storageTextures) {
-            CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-            if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
-        }
-    }
+    completeCpuWrites();
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
