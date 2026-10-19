@@ -869,6 +869,7 @@ private:
         std::size_t bytes;
         std::shared_ptr<Buffer> buffer;
         VkDeviceSize offset = 0;
+        std::uint64_t generation = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
     std::array<std::uint64_t, 3> unwrittenStamp{};

@@ -2693,7 +2693,7 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
-    if (stamp == unwrittenStamp) return;
+    if (stamp[1] == unwrittenStamp[1] && stamp[2] == unwrittenStamp[2]) return;
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
@@ -2703,6 +2703,11 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
     if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    if (found->second.generation != stamp[0] && !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+        unwrittenBytes -= found->second.bytes;
+        unwrittenSnapshots.erase(found);
+        return {};
+    }
     if (offset != nullptr) *offset = found->second.offset;
     return found->second.buffer;
 }
@@ -2714,7 +2719,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
         unwrittenSnapshots.erase(found);
     }
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
-    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset, stamp[0]});
     unwrittenBytes += bytes;
 }
 
