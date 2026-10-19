@@ -3538,6 +3538,14 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (!eager && borrowedUnits.empty() && first + count <= trackedLayers && std::all_of(layerPending.begin() + first, layerPending.begin() + first + count, [](bool pending) { return pending; })) {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (dirty && !lent) {
+            ++version;
+            return;
+        }
+    }
     std::vector<bool> unsaved(trackedLayers, false);
     bool anyUnsaved = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
