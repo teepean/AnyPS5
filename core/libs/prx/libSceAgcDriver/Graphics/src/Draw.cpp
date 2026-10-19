@@ -2462,7 +2462,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         static std::atomic<int> reported{0};
         if (!same && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draws] APS5_VERIFY_TARGET_MEMO: the target memo held but the lookup differs (%zu targets, the first at 0x%llx)\n", state.colors.size(), static_cast<unsigned long long>(state.colors.front().address));
     }
-    outcome.keptTargets = targetsKept;
+    outcome.keptTargets = targetsKept || verifyTargets;
     if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
