@@ -3643,7 +3643,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
-bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool ordered) {
     if (published != nullptr) *published = false;
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
@@ -3704,7 +3704,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
+    if (auto* recorder = Recorder::Active(); !ordered && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
@@ -3967,7 +3967,7 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
         const auto address = texture->descriptor.baseAddress;
         const auto bytes = static_cast<std::size_t>(texture->guestBytes);
         if (!HostImportCovers(texture->context, address, bytes)) continue;
-        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+        if (FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, true)) ++stored;
     }
     return stored;
 }
