@@ -2652,14 +2652,14 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
-    std::array<std::atomic<std::uint64_t>, 10> memo{};
+    std::array<std::atomic<std::uint64_t>, 11> memo{};
     std::atomic<std::uint64_t> memoTaken{0};
     std::atomic<std::uint64_t> memoVerified{0};
     std::atomic<std::uint64_t> memoWrong{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
-constexpr std::array<const char*, 10> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges"};
+constexpr std::array<const char*, 11> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges", "renewed"};
 
 bool ProofMemoEnabled() {
     static const bool disabled = std::getenv("APS5_NO_PROOF_MEMO") != nullptr;
@@ -3162,10 +3162,12 @@ bool ShaderResources::completeCpuWrites() {
     return synced;
 }
 
-std::size_t ShaderResources::proofMemoMiss() const {
-    const auto& memo = proofMemo;
+std::size_t ShaderResources::proofMemoMiss() {
+    auto& memo = proofMemo;
     if (!memo.valid) return 1;
-    if (memo.epoch == 0 || memo.epoch != GuestMemory::ThreadCollectEpoch()) return 3;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (memo.epoch == 0 || epoch == 0) return 3;
+    const bool renewed = memo.epoch != epoch;
     if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || memo.depthSurfaces != DepthSurfacesSerial()) return 4;
     if (pendingSerialSeen == 0 || pendingSerialSeen != StorageTexture::PendingSerial()) return 5;
     for (const auto& [image, version] : memo.images) {
@@ -3182,9 +3184,14 @@ std::size_t ShaderResources::proofMemoMiss() const {
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
     auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
     queries.clear();
-    for (const auto& [address, bytes] : memo.ranges) queries.push_back({address, bytes, memo.generation});
-    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return 9;
-    return 0;
+    for (const auto& [address, bytes] : memo.ranges) {
+        if (renewed && GuestMemory::CollectWrites(address, bytes) == 0) return 3;
+        queries.push_back({address, bytes, memo.generation});
+    }
+    if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return renewed ? 3 : 9;
+    if (!renewed) return 0;
+    memo.epoch = epoch;
+    return 10;
 }
 
 void ShaderResources::takeProofMemo(const ProofMemo& before) {
@@ -3203,7 +3210,11 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         memo.keyRanges.emplace_back(dccAddress, keys);
     };
     for (const auto& surface : validatedTextures) {
-        if (!surface.valid || surface.depth) return;
+        if (!surface.valid) return;
+        if (surface.depth) {
+            if (surface.resource.dimension != TextureDimension::k2D) return;
+            continue;
+        }
         addSurface(surface.resource.baseAddress, surface.bytes, surface.resource.dccAddress);
         if (surface.source == nullptr) continue;
         const auto& own = surface.source->Descriptor();
@@ -3248,8 +3259,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto miss = proofMemoMiss();
-    if (miss == 0 && completeCpuWrites()) miss = 2;
+    if ((miss == 0 || miss == 10) && completeCpuWrites()) miss = 2;
     if (profile) Revalidations().memo[miss].fetch_add(1, std::memory_order_relaxed);
+    if (miss == 10) miss = 0;
     if (miss == 0 && !VerifyProofMemo()) {
         if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
         const bool ok = finishProofMemoHit();

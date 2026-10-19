@@ -552,7 +552,7 @@ private:
     };
     bool revalidate(std::span<const CompiledShader> shaders, ProofReport* report);
     bool completeCpuWrites();
-    std::size_t proofMemoMiss() const;
+    std::size_t proofMemoMiss();
     void takeProofMemo(const ProofMemo& before);
     bool finishProofMemoHit();
     Context context;
