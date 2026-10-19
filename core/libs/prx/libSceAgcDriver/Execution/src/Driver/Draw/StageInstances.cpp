@@ -71,6 +71,8 @@ struct Entry {
     bool retired = false;
     bool ready = false;
     std::uint32_t stable = 0;
+    std::uint32_t failures = 0;
+    mutable std::uint32_t skip = 0;
 };
 
 enum Miss : std::uint8_t { MissNoEntry, MissNotLearned, MissBlocked, MissNotReady, MissUser, MissPointerFlags, MissVertex, MissDraw, MissRead, MissWord, MissCarry, MissCount };
@@ -95,6 +97,7 @@ struct Counters {
     std::uint64_t regionMismatches = 0;
     std::uint64_t checks = 0;
     std::uint64_t retired = 0;
+    std::uint64_t skippedLearns = 0;
     std::uint64_t fastTimed = 0;
     double fastUs = 0.0;
     std::uint64_t fullTimed = 0;
@@ -312,7 +315,7 @@ std::optional<Source> findAddressSource(const Inputs& before, const Inputs& now,
     return std::nullopt;
 }
 
-std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw, const ShaderRecompiler::RecompileResult& current) {
+std::optional<LearnFail> learn(const Entry& entry, Entry& next, const std::vector<Run>& runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw, const ShaderRecompiler::RecompileResult& current) {
     const auto& previous = *entry.result;
     if (!sameRuns(entry.runs, runs) || entry.userData.size() != userData.size()) return FailStructure;
     if (previous.PipelineVariantId() != current.PipelineVariantId() || previous.variantId != current.variantId) return FailVariant;
@@ -416,19 +419,23 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
         if (was == is || covered(FieldKind::Push, 0, d)) continue;
         if (!add(FieldKind::Push, 0, d, was, is)) return FailNoSource;
     }
-    entry.patches = std::move(patches);
-    for (std::size_t u = 0; u < userData.size(); ++u) {
-        if (userData[u] != entry.userData[u]) entry.userObserved[u] = true;
+    next.patches = std::move(patches);
+    next.userObserved = entry.userObserved;
+    next.wordObserved = entry.wordObserved;
+    next.vertexObserved = entry.vertexObserved;
+    next.drawObserved = entry.drawObserved;
+    for (std::size_t u = 0; u < userData.size() && u < next.userObserved.size(); ++u) {
+        if (userData[u] != entry.userData[u]) next.userObserved[u] = true;
     }
-    for (std::size_t w = 0; w < words.size(); ++w) {
-        if (words[w] != entry.words[w]) entry.wordObserved[w] = true;
+    for (std::size_t w = 0; w < words.size() && w < next.wordObserved.size(); ++w) {
+        if (words[w] != entry.words[w]) next.wordObserved[w] = true;
     }
-    for (std::size_t v = 0; v < vertexWords(vertex); ++v) {
+    for (std::size_t v = 0; v < vertexWords(vertex) && v < next.vertexObserved.size(); ++v) {
         if (v % 4u == 3u) continue;
-        if (vertexWord(*vertex, static_cast<std::uint32_t>(v)) != vertexWord(*entry.vertex, static_cast<std::uint32_t>(v))) entry.vertexObserved[v] = true;
+        if (vertexWord(*vertex, static_cast<std::uint32_t>(v)) != vertexWord(*entry.vertex, static_cast<std::uint32_t>(v))) next.vertexObserved[v] = true;
     }
     for (std::size_t d = 0; d < DrawWords; ++d) {
-        if (draw[d] != entry.draw[d]) entry.drawObserved[d] = true;
+        if (draw[d] != entry.draw[d]) next.drawObserved[d] = true;
     }
     return std::nullopt;
 }
@@ -483,7 +490,7 @@ void report(State& value) {
         std::snprintf(piece, sizeof(piece), " %s %llu", LearnFailNames[f], static_cast<unsigned long long>(c.failed[f]));
         line += piece;
     }
-    std::snprintf(piece, sizeof(piece), "; self-checks %llu, shapes retired %llu", static_cast<unsigned long long>(c.checks), static_cast<unsigned long long>(c.retired));
+    std::snprintf(piece, sizeof(piece), "; self-checks %llu, shapes retired %llu, learnings skipped %llu", static_cast<unsigned long long>(c.checks), static_cast<unsigned long long>(c.retired), static_cast<unsigned long long>(c.skippedLearns));
     line += piece;
     std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions (patched %llu, unpatched %llu, shape %llu); fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), static_cast<unsigned long long>(c.mismatchedPatched), static_cast<unsigned long long>(c.mismatchedUnpatched), static_cast<unsigned long long>(c.mismatchedShape), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
     line += piece;
@@ -678,15 +685,22 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
         std::lock_guard lock(value.mutex);
         const auto found = value.entries.find(key);
         if (found != value.entries.end()) previous = found->second;
+        if (previous != nullptr && previous->skip != 0 && previous->shader == shader) {
+            --previous->skip;
+            ++value.counters.skippedLearns;
+            return;
+        }
     }
     auto entry = std::make_shared<Entry>();
     std::optional<LearnFail> failure;
     const bool comparable = previous != nullptr && previous->result != nullptr && previous->shader == shader;
     if (comparable) {
-        *entry = *previous;
-        failure = learn(*entry, runs, words, userData, vertex, draw, *compiled);
+        entry->retired = previous->retired;
+        failure = learn(*previous, *entry, runs, words, userData, vertex, draw, *compiled);
         entry->learned = !failure.has_value();
         entry->stable = failure ? 0u : previous->stable + 1u;
+        entry->failures = failure ? previous->failures + 1u : 0u;
+        entry->skip = failure && entry->failures >= 2u ? std::min(64u, 1u << std::min(entry->failures, 6u)) : 0u;
         if (failure) entry->patches.clear();
     }
     const auto& snapshot = capture.snapshot;

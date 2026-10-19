@@ -432,7 +432,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
     }
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
+    const bool instanced = StageInstancesEnabled() && std::any_of(stageCaptures.begin(), stageCaptures.end(), [](const StageCapture& stage) { return stage.compiled != nullptr && stage.capture == nullptr; });
+    if (!instanced) cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
