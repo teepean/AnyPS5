@@ -360,6 +360,24 @@ std::optional<Source> findAddressSource(const Inputs& before, const Inputs& now,
     return std::nullopt;
 }
 
+std::optional<std::uint32_t> userQuad(const Inputs& before, const Inputs& now, const std::uint32_t* previous, const std::uint32_t* current) {
+    std::optional<std::uint32_t> found;
+    for (std::uint32_t u = 0; u + 3u < before.userData.size() && u + 3u < now.userData.size(); ++u) {
+        bool same = true;
+        for (std::uint32_t k = 0; k < 4u && same; ++k) same = before.userData[u + k] == previous[k] && now.userData[u + k] == current[k];
+        if (!same) continue;
+        if (found) return std::nullopt;
+        found = u;
+    }
+    return found;
+}
+
+std::uint32_t pairHighBits(const Source& source, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> words) {
+    if (source.kind == SourceKind::User) return userData[source.index + 1u] >> 16u;
+    if (source.kind == SourceKind::Word) return words[source.index + 1u] >> 16u;
+    return 0;
+}
+
 std::optional<LearnFail> learn(const Entry& entry, Entry& next, const std::vector<Run>& runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw, const ShaderRecompiler::RecompileResult& current) {
     const auto& previous = *entry.result;
     if (!sameRuns(entry.runs, runs) || entry.userData.size() != userData.size()) return FailStructure;
@@ -446,7 +464,10 @@ std::optional<LearnFail> learn(const Entry& entry, Entry& next, const std::vecto
                     patches.push_back({FieldKind::Address, b, e, *source, 0, false});
                 }
                 if (x[2] != y[2] && !covered(FieldKind::Binding, b, e * 4u + 2u)) {
-                    const auto source = findSource(before, now, x[2], y[2], true, true);
+                    auto source = findSource(before, now, x[2], y[2], true, true);
+                    if (!source) {
+                        if (const auto quad = userQuad(before, now, x, y)) source = Source{SourceKind::User, *quad + 2u, 0};
+                    }
                     if (!source) return FailNoSource;
                     patches.push_back({FieldKind::Binding, b, e * 4u + 2u, *source, 0, false});
                 }
@@ -671,6 +692,7 @@ Attempt attempt(const Entry& entry, std::span<const std::uint32_t> userData, con
     bool changed = false;
     for (const auto& patch : entry.patches) {
         if (patch.kind == FieldKind::Address) {
+            if (pairHighBits(patch.source, userData, words) != pairHighBits(patch.source, entry.userData, entry.words)) return fail(MissCarry);
             if (addressValue(patch.source, userData, words, vertex, draw) != addressOf(entry.result->bindings[patch.binding], patch.word)) changed = true;
             continue;
         }
