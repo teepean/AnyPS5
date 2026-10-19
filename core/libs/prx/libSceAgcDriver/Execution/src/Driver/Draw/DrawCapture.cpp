@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ShapeCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageInstances.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -34,6 +35,33 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
+    const auto instanceKey = StageInstancesEnabled() && dumpTarget == 0 && dumpSlot1 == 0 ? StageInstanceKey(program.snapshot.get(), program.binary.codeAddress, program.codeOffset, request) : 0;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> fastResult;
+    std::vector<ShaderRecompiler::MemoryRegion> fastRegions;
+    if (instanceKey != 0) {
+        auto hit = StageInstanceTry(instanceKey, program.userData, vertexInfos[i], shaderMemory);
+        fastRegions = shaderMemory.TakeRecentRegions();
+        if (hit) {
+            fastResult = hit->compiled;
+            if (!StageInstancesVerify()) {
+                stageCapture.regions = std::move(fastRegions);
+                stageCapture.supplied = shaderMemory.SuppliedBlocks();
+                stageCapture.userDataUse = std::move(hit->userDataUse);
+                stageCapture.compiled = std::move(fastResult);
+                stageCapture.capture = nullptr;
+                recompiled[i] = true;
+                memory = shaderMemory.Regions();
+                for (std::size_t j = 0; j < programs.size(); ++j) {
+                    if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
+                }
+                if (profile) ++captures;
+                phaseTiming.Phase(DrawRowCapture);
+                timing.Mark("stage_instance");
+                return stageCapture.compiled;
+            }
+        }
+    }
+    const auto fullStart = instanceKey != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto named = [&](const std::exception& error) {
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         std::string dump;
@@ -104,6 +132,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         throw named(error);
     }
     stageCapture.capture = capture;
+    if (instanceKey != 0) {
+        StageInstanceTimed(0.0, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fullStart).count());
+        if (fastResult != nullptr) StageInstanceCompare(program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
+        StageInstanceLearn(instanceKey, program.snapshot, program.userData, vertexInfos[i], *capture, stageCapture.regions, stageCapture.compiled);
+    }
     if (ShapeCensusEnabled()) ShapeCensusStage(program.binary.codeAddress, program.codeOffset, pushOffset, program.userData, capture, stageCapture.regions, stageCapture.compiled, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - censusStart).count());
     timing.Mark("materialize");
     phaseTiming.Phase(DrawRowRecompile);

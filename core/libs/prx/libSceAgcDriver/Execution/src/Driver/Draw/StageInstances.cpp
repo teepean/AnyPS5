@@ -1,0 +1,514 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/StageInstances.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+namespace AgcDriver::DriverDetail {
+namespace {
+
+
+struct Run {
+    std::int32_t origin;
+    std::uint64_t at;
+    std::uint32_t words;
+    std::uint32_t first;
+};
+
+enum class SourceKind : std::uint8_t { User, Word, Vertex };
+
+struct Source {
+    SourceKind kind;
+    std::uint32_t index;
+    std::uint32_t delta;
+};
+
+enum class FieldKind : std::uint8_t { Binding, Push };
+
+struct Patch {
+    FieldKind kind;
+    std::uint32_t binding;
+    std::uint32_t word;
+    Source source;
+};
+
+struct Entry {
+    std::shared_ptr<const void> shader;
+    std::vector<Run> runs;
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint32_t> userData;
+    std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
+    ShaderRecompiler::SrtUserDataUse use;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    std::vector<Patch> patches;
+    std::vector<bool> userFree;
+    std::vector<bool> wordFree;
+    bool learned = false;
+};
+
+enum Miss : std::uint8_t { MissNoEntry, MissNotLearned, MissUser, MissPointerFlags, MissVertex, MissRead, MissWord, MissCount };
+constexpr const char* MissNames[MissCount] = {"no entry", "not learned", "user word", "pointer flags", "vertex", "read", "run word"};
+
+enum LearnFail : std::uint8_t { FailStructure, FailVariant, FailBindings, FailPushSize, FailVertex, FailForwarded, FailNoSource, FailCount };
+constexpr const char* LearnFailNames[FailCount] = {"structure", "variant", "bindings", "push size", "vertex", "forwarded words", "no source"};
+
+struct Counters {
+    std::uint64_t lookups = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t shared = 0;
+    std::uint64_t patchedWords = 0;
+    std::array<std::uint64_t, MissCount> misses{};
+    std::uint64_t learned = 0;
+    std::array<std::uint64_t, FailCount> failed{};
+    std::uint64_t compared = 0;
+    std::uint64_t mismatched = 0;
+    std::uint64_t regionMismatches = 0;
+    std::uint64_t fastTimed = 0;
+    double fastUs = 0.0;
+    std::uint64_t fullTimed = 0;
+    double fullUs = 0.0;
+};
+
+struct State {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const Entry>> entries;
+    Counters counters;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+State& state() {
+    static State* value = new State();
+    return *value;
+}
+
+thread_local std::uint64_t currentShape = 0;
+
+void mix(std::uint64_t& hash, std::uint64_t value) {
+    hash ^= value;
+    hash *= 0x100000001b3ull;
+    hash ^= hash >> 31u;
+}
+
+std::uint32_t aligned(std::uint32_t value) {
+    return value & ~std::uint32_t{3};
+}
+
+std::vector<Run> relativeRuns(std::span<const std::uint32_t> userData, const ShaderRecompiler::SrtUserDataUse& use, std::span<const ShaderRecompiler::MemoryRegion> regions, std::vector<std::uint32_t>& words) {
+    auto reads = use.reads;
+    std::sort(reads.begin(), reads.end());
+    const auto origin = [&](std::uint64_t address) -> std::int32_t {
+        const auto found = std::lower_bound(reads.begin(), reads.end(), std::make_pair(address, std::numeric_limits<std::int32_t>::min()));
+        if (found == reads.end() || found->first != address || found->second < 0 || static_cast<std::size_t>(found->second) >= userData.size()) return -1;
+        return found->second;
+    };
+    std::vector<Run> runs;
+    words.clear();
+    for (const auto& region : regions) {
+        const auto count = region.bytes.size() / sizeof(std::uint32_t);
+        if (count == 0) continue;
+        const auto first = words.size();
+        words.resize(first + count);
+        std::memcpy(words.data() + first, region.bytes.data(), count * sizeof(std::uint32_t));
+        std::size_t start = 0;
+        auto current = origin(region.guestAddress);
+        for (std::size_t word = 1; word <= count; ++word) {
+            const auto next = word < count ? origin(region.guestAddress + word * sizeof(std::uint32_t)) : std::int32_t{-2};
+            if (next == current) continue;
+            const auto address = region.guestAddress + start * sizeof(std::uint32_t);
+            const auto base = current >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(current)])) : 0u;
+            runs.push_back({current, current >= 0 ? address - base : address, static_cast<std::uint32_t>(word - start), static_cast<std::uint32_t>(first + start)});
+            start = word;
+            current = next;
+        }
+    }
+    return runs;
+}
+
+bool sameRuns(const std::vector<Run>& left, const std::vector<Run>& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i].origin != right[i].origin || left[i].at != right[i].at || left[i].words != right[i].words || left[i].first != right[i].first) return false;
+    }
+    return true;
+}
+
+bool sameBindingShape(const ShaderRecompiler::DescriptorBinding& a, const ShaderRecompiler::DescriptorBinding& b) {
+    return a.kind == b.kind && a.role == b.role && a.descriptorSet == b.descriptorSet && a.binding == b.binding && a.count == b.count && a.readOnly == b.readOnly && a.imageShape == b.imageShape && a.guestDescriptor.size() == b.guestDescriptor.size() && a.samplerDepthCompare == b.samplerDepthCompare && a.imageWritten == b.imageWritten && a.imageDepthCompare == b.imageDepthCompare && a.imageAtomic == b.imageAtomic && a.imageAtomic64 == b.imageAtomic64 && a.imageShapes == b.imageShapes && a.bufferAtomic == b.bufferAtomic && a.bufferWritten == b.bufferWritten && a.samplerUnnormalized == b.samplerUnnormalized && a.samplerIntegerBorder == b.samplerIntegerBorder && a.samplerCoordinatesIgnored == b.samplerCoordinatesIgnored && a.imageUnnormalized == b.imageUnnormalized && a.imageUnnormalizedBaseLevel == b.imageUnnormalizedBaseLevel && a.imageSamplers == b.imageSamplers && a.bufferRead == b.bufferRead && a.bufferExtent == b.bufferExtent;
+}
+
+std::uint32_t pushWord(const ShaderRecompiler::RecompileResult& result, std::size_t index) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, result.pushConstants.data() + index * sizeof(std::uint32_t), sizeof(value));
+    return value;
+}
+
+std::uint32_t vertexWord(const ShaderRecompiler::ShaderVertexStageInfo& vertex, std::uint32_t index) {
+    return vertex.resources[index / 4u].fields[index % 4u];
+}
+
+std::uint32_t sourceValue(const Source& source, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> words, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+    switch (source.kind) {
+        case SourceKind::User: return userData[source.index] + source.delta;
+        case SourceKind::Word: return words[source.index] + source.delta;
+        case SourceKind::Vertex: return vertexWord(*vertex, source.index) + source.delta;
+    }
+    return 0;
+}
+
+struct Candidates {
+    std::span<const std::uint32_t> previousUser, currentUser, previousWords, currentWords;
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* previousVertex;
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* currentVertex;
+};
+
+std::optional<Source> findSource(const Candidates& from, std::uint32_t previous, std::uint32_t current) {
+    const auto vertexWords = from.currentVertex->has_value() && from.previousVertex->has_value() ? std::min((*from.currentVertex)->resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources) * 4u : 0u;
+    for (int pass = 0; pass < 2; ++pass) {
+        const auto matches = [&](std::uint32_t before, std::uint32_t now) {
+            if (pass == 0) return before == previous && now == current;
+            return before != now && current - now == previous - before;
+        };
+        for (std::uint32_t u = 0; u < from.currentUser.size() && u < from.previousUser.size(); ++u) {
+            if (matches(from.previousUser[u], from.currentUser[u])) return Source{SourceKind::User, u, current - from.currentUser[u]};
+        }
+        for (std::uint32_t v = 0; v < vertexWords; ++v) {
+            const auto before = vertexWord(**from.previousVertex, v);
+            const auto now = vertexWord(**from.currentVertex, v);
+            if (matches(before, now)) return Source{SourceKind::Vertex, v, current - now};
+        }
+        for (std::uint32_t w = 0; w < from.currentWords.size() && w < from.previousWords.size(); ++w) {
+            if (matches(from.previousWords[w], from.currentWords[w])) return Source{SourceKind::Word, w, current - from.currentWords[w]};
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const ShaderRecompiler::RecompileResult& current) {
+    const auto& previous = *entry.result;
+    if (!sameRuns(entry.runs, runs) || entry.userData.size() != userData.size()) return FailStructure;
+    if (previous.PipelineVariantId() != current.PipelineVariantId() || previous.variantId != current.variantId) return FailVariant;
+    if (previous.bindings.size() != current.bindings.size()) return FailBindings;
+    if (previous.pushConstants.size() != current.pushConstants.size()) return FailPushSize;
+    if (previous.shaderDataUserWords != current.shaderDataUserWords) return FailForwarded;
+    if (entry.vertex.has_value() != vertex.has_value() || previous.vertexAttributes.size() != current.vertexAttributes.size()) return FailVertex;
+    for (std::size_t a = 0; a < current.vertexAttributes.size(); ++a) {
+        const auto& was = previous.vertexAttributes[a];
+        const auto& is = current.vertexAttributes[a];
+        if (was.location != is.location || was.components != is.components || was.formatComponents != is.formatComponents || was.resource.fields[3] != is.resource.fields[3] || (was.resource.fields[1] >> 16u) != (is.resource.fields[1] >> 16u)) return FailVertex;
+    }
+    const Candidates from{entry.userData, userData, entry.words, words, &entry.vertex, &vertex};
+    std::vector<Patch> patches;
+    for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
+        const auto& was = previous.bindings[b];
+        const auto& is = current.bindings[b];
+        if (!sameBindingShape(was, is)) return FailBindings;
+        for (std::uint32_t w = 0; w < is.guestDescriptor.size(); ++w) {
+            if (was.guestDescriptor[w] == is.guestDescriptor[w]) continue;
+            const auto source = findSource(from, was.guestDescriptor[w], is.guestDescriptor[w]);
+            if (!source) return FailNoSource;
+            patches.push_back({FieldKind::Binding, b, w, *source});
+        }
+    }
+    const auto pushWords = current.pushConstants.size() / sizeof(std::uint32_t);
+    if (std::memcmp(previous.pushConstants.data() + pushWords * sizeof(std::uint32_t), current.pushConstants.data() + pushWords * sizeof(std::uint32_t), current.pushConstants.size() - pushWords * sizeof(std::uint32_t)) != 0) return FailPushSize;
+    for (std::uint32_t d = 0; d < pushWords; ++d) {
+        const auto was = pushWord(previous, d);
+        const auto is = pushWord(current, d);
+        if (was == is) continue;
+        const auto source = findSource(from, was, is);
+        if (!source) return FailNoSource;
+        patches.push_back({FieldKind::Push, 0, d, *source});
+    }
+    entry.patches = std::move(patches);
+    return std::nullopt;
+}
+
+void store(Entry& entry, const std::shared_ptr<const void>& shader, std::vector<Run> runs, std::vector<std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const ShaderRecompiler::SrtUserDataUse& use, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result) {
+    entry.shader = shader;
+    entry.runs = std::move(runs);
+    entry.words = std::move(words);
+    entry.userData.assign(userData.begin(), userData.end());
+    entry.vertex = vertex;
+    entry.use = use;
+    entry.result = result;
+    entry.userFree.assign(entry.userData.size(), false);
+    entry.wordFree.assign(entry.words.size(), false);
+    std::uint64_t origins = 0;
+    for (const auto& run : entry.runs) {
+        if (run.origin >= 0 && run.origin < 64) origins |= std::uint64_t{1} << run.origin;
+    }
+    auto reads = entry.use.reads;
+    std::sort(reads.begin(), reads.end());
+    for (std::size_t r = 0; r < reads.size(); ++r) {
+        const auto drop = [&](std::int32_t origin) {
+            if (origin >= 0 && origin < 64) origins &= ~(std::uint64_t{1} << origin);
+        };
+        if (r + 1 < reads.size() && reads[r].first == reads[r + 1].first && reads[r].second != reads[r + 1].second) {
+            drop(reads[r].second);
+            drop(reads[r + 1].second);
+        }
+        if ((reads[r].first & 3u) != 0) drop(reads[r].second);
+    }
+    for (std::uint32_t u = 0; u < entry.userData.size() && u < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++u) {
+        if ((origins >> u & 1u) != 0 && (entry.use.asBase >> u & 1u) != 0 && (entry.use.asValue >> u & 1u) == 0) entry.userFree[u] = true;
+    }
+    for (const auto& patch : entry.patches) {
+        if (patch.source.kind == SourceKind::User && patch.source.index < entry.userFree.size()) entry.userFree[patch.source.index] = true;
+        if (patch.source.kind == SourceKind::Word && patch.source.index < entry.wordFree.size()) entry.wordFree[patch.source.index] = true;
+    }
+}
+
+void report(State& value) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - value.reported < std::chrono::seconds(10)) return;
+    value.reported = now;
+    auto& c = value.counters;
+    std::string line;
+    char piece[200];
+    std::snprintf(piece, sizeof(piece), "[stage-instances] (10 s): %llu lookups, %llu hits (%.1f%%; %llu shared the cached result, %.2f words patched per hit); misses:", static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.hits), c.lookups != 0 ? 100.0 * static_cast<double>(c.hits) / static_cast<double>(c.lookups) : 0.0, static_cast<unsigned long long>(c.shared), c.hits != 0 ? static_cast<double>(c.patchedWords) / static_cast<double>(c.hits) : 0.0);
+    line += piece;
+    for (std::size_t m = 0; m < MissCount; ++m) {
+        std::snprintf(piece, sizeof(piece), " %s %llu", MissNames[m], static_cast<unsigned long long>(c.misses[m]));
+        line += piece;
+    }
+    std::snprintf(piece, sizeof(piece), "; learned %llu, failed:", static_cast<unsigned long long>(c.learned));
+    line += piece;
+    for (std::size_t f = 0; f < FailCount; ++f) {
+        std::snprintf(piece, sizeof(piece), " %s %llu", LearnFailNames[f], static_cast<unsigned long long>(c.failed[f]));
+        line += piece;
+    }
+    std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions; fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
+    line += piece;
+    std::fprintf(stderr, "%s\n", line.c_str());
+    c = Counters{};
+}
+
+}
+
+bool StageInstancesEnabled() {
+    static const bool enabled = std::getenv("APS5_SHAPE_INSTANCES") != nullptr || std::getenv("APS5_VERIFY_SHAPE_INSTANCES") != nullptr;
+    return enabled;
+}
+
+bool StageInstancesVerify() {
+    static const bool verify = std::getenv("APS5_VERIFY_SHAPE_INSTANCES") != nullptr;
+    return verify;
+}
+
+void StageInstancesBeginDraw(std::uint64_t shapeKey) {
+    currentShape = shapeKey;
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    report(value);
+}
+
+std::uint64_t StageInstanceKey(const void* shader, std::uint64_t codeAddress, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+    if (request.graphics && (request.graphics->mesh || request.graphics->tessellation)) return 0;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    if (request.graphics) mix(hash, request.graphics->firstUserSgpr);
+    mix(hash, reinterpret_cast<std::uintptr_t>(shader));
+    mix(hash, codeAddress);
+    mix(hash, codeOffset);
+    mix(hash, currentShape);
+    mix(hash, request.layout.pushConstantOffsetBytes);
+    mix(hash, request.layout.pushConstantSizeBytes);
+    mix(hash, request.context.waveSize);
+    mix(hash, request.context.userData.size());
+    if (request.context.pixel) {
+        const auto& pixel = *request.context.pixel;
+        for (const auto mapping : pixel.targetExportMapping) mix(hash, mapping);
+        for (const auto packing : pixel.targetExportPacking) mix(hash, static_cast<std::uint64_t>(packing));
+        mix(hash, pixel.dualSourceBlend);
+        mix(hash, pixel.reversedBlend);
+        mix(hash, static_cast<std::uint64_t>(pixel.rasterPrimitive));
+        mix(hash, pixel.layerExported);
+    } else {
+        mix(hash, 1ull << 40u);
+    }
+    if (request.context.vertex) {
+        const auto& vertex = *request.context.vertex;
+        const auto count = std::min(vertex.resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources);
+        mix(hash, count);
+        mix(hash, vertex.fetchAttribReg);
+        mix(hash, vertex.fetchBufferReg);
+        mix(hash, vertex.fetchEmbedded);
+        mix(hash, vertex.paClVsOutCntl);
+        mix(hash, vertex.depthRemapMode);
+        for (std::uint32_t r = 0; r < count; ++r) {
+            mix(hash, vertex.resources[r].fields[3]);
+            mix(hash, vertex.resources[r].fields[1] >> 16u);
+            const auto& destination = vertex.resourcesDst[r];
+            mix(hash, static_cast<std::uint32_t>(destination.registerStart) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(destination.registersNum)) << 32u));
+            mix(hash, static_cast<std::uint32_t>(destination.attrId) | (static_cast<std::uint64_t>(destination.fetchIndex) << 32u));
+        }
+    } else {
+        mix(hash, 1ull << 41u);
+    }
+    return hash != 0 ? hash : 1;
+}
+
+std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, ShaderMemory& memory) {
+    if (key == 0) return std::nullopt;
+    const auto started = std::chrono::steady_clock::now();
+    auto& value = state();
+    std::shared_ptr<const Entry> held;
+    {
+        std::lock_guard lock(value.mutex);
+        ++value.counters.lookups;
+        const auto found = value.entries.find(key);
+        if (found != value.entries.end()) held = found->second;
+    }
+    const auto missed = [&](Miss reason) -> std::optional<StageInstanceHit> {
+        std::lock_guard lock(value.mutex);
+        ++value.counters.misses[reason];
+        return std::nullopt;
+    };
+    if (held == nullptr) return missed(MissNoEntry);
+    const auto& entry = *held;
+    if (!entry.learned) return missed(MissNotLearned);
+    if (entry.userData.size() != userData.size()) return missed(MissUser);
+    for (std::size_t u = 0; u < userData.size(); ++u) {
+        if (!entry.userFree[u] && userData[u] != entry.userData[u]) return missed(MissUser);
+    }
+    for (const auto& run : entry.runs) {
+        if (run.origin < 0) continue;
+        const auto now = userData[static_cast<std::size_t>(run.origin)];
+        const auto was = entry.userData[static_cast<std::size_t>(run.origin)];
+        if (now == 0 || ((now ^ was) & 3u) != 0) return missed(MissPointerFlags);
+    }
+    if (entry.vertex.has_value() != vertex.has_value() || (vertex.has_value() && vertex->resourcesNum != entry.vertex->resourcesNum)) return missed(MissVertex);
+    std::vector<std::uint32_t> words(entry.words.size());
+    for (const auto& run : entry.runs) {
+        const auto address = run.origin >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(run.origin)])) + run.at : run.at;
+        if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return missed(MissRead);
+    }
+    for (std::size_t w = 0; w < words.size(); ++w) {
+        if (!entry.wordFree[w] && words[w] != entry.words[w]) return missed(MissWord);
+    }
+    bool changed = false;
+    for (const auto& patch : entry.patches) {
+        const auto patched = sourceValue(patch.source, userData, words, vertex);
+        const auto cached = patch.kind == FieldKind::Binding ? entry.result->bindings[patch.binding].guestDescriptor[patch.word] : pushWord(*entry.result, patch.word);
+        if (patched != cached) changed = true;
+    }
+    for (const auto& attribute : entry.result->vertexAttributes) {
+        if (!vertex.has_value() || attribute.location >= vertex->resources.size()) continue;
+        const auto& resource = vertex->resources[attribute.location];
+        if (resource.fields != attribute.resource.fields) changed = true;
+        if (vertex->fetchEmbedded && vertex->resourcesDst[attribute.location].fetchIndex != attribute.fetchIndex) changed = true;
+    }
+    StageInstanceHit hit{entry.result, entry.use};
+    if (changed) {
+        auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*entry.result);
+        for (const auto& patch : entry.patches) {
+            const auto patched = sourceValue(patch.source, userData, words, vertex);
+            if (patch.kind == FieldKind::Binding) result->bindings[patch.binding].guestDescriptor[patch.word] = patched;
+            else std::memcpy(result->pushConstants.data() + patch.word * sizeof(std::uint32_t), &patched, sizeof(patched));
+        }
+        for (auto& attribute : result->vertexAttributes) {
+            if (!vertex.has_value() || attribute.location >= vertex->resources.size()) continue;
+            attribute.resource = vertex->resources[attribute.location];
+            if (vertex->fetchEmbedded) attribute.fetchIndex = vertex->resourcesDst[attribute.location].fetchIndex;
+        }
+        hit.compiled = std::move(result);
+    }
+    const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+    std::lock_guard lock(value.mutex);
+    auto& c = value.counters;
+    if (changed) c.patchedWords += entry.patches.size();
+    else ++c.shared;
+    ++c.hits;
+    ++c.fastTimed;
+    c.fastUs += elapsed;
+    return hit;
+}
+
+void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& shader, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const ShaderRecompiler::ResourceCapture& capture, std::span<const ShaderRecompiler::MemoryRegion> regions, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
+    if (compiled == nullptr || key == 0) return;
+    std::vector<std::uint32_t> words;
+    auto runs = relativeRuns(userData, capture.userDataUse, regions, words);
+    auto& value = state();
+    std::shared_ptr<const Entry> previous;
+    {
+        std::lock_guard lock(value.mutex);
+        const auto found = value.entries.find(key);
+        if (found != value.entries.end()) previous = found->second;
+    }
+    auto entry = std::make_shared<Entry>();
+    std::optional<LearnFail> failure;
+    if (previous != nullptr && previous->result != nullptr && previous->shader == shader) {
+        *entry = *previous;
+        failure = learn(*entry, runs, words, userData, vertex, *compiled);
+        entry->learned = !failure.has_value();
+        if (failure) entry->patches.clear();
+    }
+    store(*entry, shader, std::move(runs), std::move(words), userData, vertex, capture.userDataUse, compiled);
+    std::lock_guard lock(value.mutex);
+    if (previous != nullptr && previous->result != nullptr && previous->shader == shader) {
+        if (failure) ++value.counters.failed[*failure];
+        else ++value.counters.learned;
+    }
+    value.entries[key] = std::move(entry);
+}
+
+void StageInstanceCompare(std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
+    bool same = fast.PipelineVariantId() == full.PipelineVariantId() && fast.bindings.size() == full.bindings.size() && fast.pushConstants == full.pushConstants && fast.vertexAttributes.size() == full.vertexAttributes.size();
+    const char* what = same ? "" : "variant, binding count, push constants or attribute count";
+    for (std::size_t b = 0; same && b < full.bindings.size(); ++b) {
+        if (!sameBindingShape(fast.bindings[b], full.bindings[b]) || fast.bindings[b].guestDescriptor != full.bindings[b].guestDescriptor) {
+            same = false;
+            what = "binding";
+        }
+    }
+    for (std::size_t a = 0; same && a < full.vertexAttributes.size(); ++a) {
+        const auto& x = fast.vertexAttributes[a];
+        const auto& y = full.vertexAttributes[a];
+        if (x.location != y.location || x.components != y.components || x.resource.fields != y.resource.fields || x.fetchIndex != y.fetchIndex || x.formatComponents != y.formatComponents) {
+            same = false;
+            what = "vertex attribute";
+        }
+    }
+    const auto flatten = [](std::span<const ShaderRecompiler::MemoryRegion> regions) {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
+        for (const auto& region : regions) {
+            for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= region.bytes.size(); offset += sizeof(std::uint32_t)) {
+                std::uint32_t word = 0;
+                std::memcpy(&word, region.bytes.data() + offset, sizeof(word));
+                flat.emplace_back(region.guestAddress + offset, word);
+            }
+        }
+        std::sort(flat.begin(), flat.end());
+        flat.erase(std::unique(flat.begin(), flat.end()), flat.end());
+        return flat;
+    };
+    const bool sameRegions = flatten(fastRegions) == flatten(fullRegions);
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    ++value.counters.compared;
+    if (!same) ++value.counters.mismatched;
+    if (!sameRegions) ++value.counters.regionMismatches;
+    static std::atomic<int> shown{0};
+    if ((!same || !sameRegions) && shown.fetch_add(1) < 12) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx fast result differs (%s%s)\n", static_cast<unsigned long long>(codeAddress), same ? "result equal" : what, sameRegions ? ", regions equal" : ", regions differ");
+}
+
+void StageInstanceTimed(double fastMicroseconds, double fullMicroseconds) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (fullMicroseconds > 0.0) {
+        ++value.counters.fullTimed;
+        value.counters.fullUs += fullMicroseconds;
+    }
+    static_cast<void>(fastMicroseconds);
+}
+
+}

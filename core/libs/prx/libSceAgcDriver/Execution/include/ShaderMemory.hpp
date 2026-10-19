@@ -70,6 +70,7 @@ public:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
+    [[nodiscard]] bool ReadWords(std::uint64_t address, std::span<std::uint32_t> values);
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.

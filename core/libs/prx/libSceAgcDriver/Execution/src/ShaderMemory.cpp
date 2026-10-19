@@ -336,6 +336,12 @@ bool ShaderMemory::overlapsInitial(std::uint64_t begin, std::uint64_t end) const
     return after != initial.begin() && std::prev(after)->first + std::prev(after)->second.size() > begin;
 }
 
+bool ShaderMemory::ReadWords(std::uint64_t address, std::span<std::uint32_t> values) {
+    if (values.empty()) return true;
+    if (!accessible(this, address, values.size_bytes())) return false;
+    return readWords(this, address, values.data(), values.size());
+}
+
 bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
     auto& self = *static_cast<ShaderMemory*>(context);
     if (!self.supplied.empty() && count != 0) self.spillTouching(address, count > (std::numeric_limits<std::uint64_t>::max() - address) / sizeof(std::uint32_t) ? std::numeric_limits<std::uint64_t>::max() : address + count * sizeof(std::uint32_t));

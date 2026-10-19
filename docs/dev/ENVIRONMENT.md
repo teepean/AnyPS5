@@ -347,6 +347,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_SHADOW_VERIFY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | verifies that the shadow-published bytes equal the guest bytes |
 | `APS5_SHARED_COLLECT_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | uses the tracker's shared collect-memo ring under its mutex instead of the per-thread ring |
 | `APS5_SHAPE_CENSUS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/ShapeCensus.cpp` |  | prints, every 10 s, how each draw stage capture differs from the last capture of the same program, push offset and register shape |
+| `APS5_SHAPE_INSTANCES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/StageInstances.cpp` |  | serves a draw stage that repeats a learned shape by re-reading its runs and patching the cached result instead of capturing and materializing it |
 | `APS5_SHARED_MEMORY_COUNTERS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | accumulates the memory counters into one shared set with atomic RMWs |
 | `APS5_SKIP_REQUEST_DUMPS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp` | 8 | caps RecompileRequest dumps per shader-skip reason |
 | `APS5_SKIP_SHADER` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Diagnostics.cpp` | 0 | hex program address of a shader to skip preparing |
@@ -423,6 +424,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_VERIFY_RECIPE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | makes the ordinary prepare path beside a recipe hit and compares the answers |
 | `APS5_VERIFY_REGISTER_KEYS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawRegisterKey.cpp` |  | checks the incremental register fingerprint against the full state |
 | `APS5_VERIFY_SET_LAYOUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | checks the draw's set layouts against those described from the shaders |
+| `APS5_VERIFY_SHAPE_INSTANCES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/StageInstances.cpp` |  | runs the full capture next to every APS5_SHAPE_INSTANCES hit, uses its result and counts differences |
 | `APS5_WAIT_LOCK` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | always takes the GPU mutex on a wait (no unlocked label lookup) |
 | `APS5_WAIT_LOCK_ENTRY` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | takes the GPU mutex blocking on the entry instead of trying it |
 | `APS5_WATCH_MEMORY` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | watches named guest ranges (`<hex address>:<hex bytes>[,...]`) across dispatches; needs `APS5_SYNC_DISPATCH=1` |

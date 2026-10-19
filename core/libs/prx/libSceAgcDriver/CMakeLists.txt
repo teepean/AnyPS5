@@ -220,6 +220,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRelocate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/ShapeCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/StageInstances.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
