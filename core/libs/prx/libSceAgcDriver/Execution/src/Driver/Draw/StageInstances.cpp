@@ -352,15 +352,33 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
     const auto covered = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word) {
         return std::any_of(patches.begin(), patches.end(), [&](const Patch& patch) { return patch.kind == kind && patch.binding == binding && patch.word == word; });
     };
+    const auto& forwarded = current.shaderDataUserWords;
+    const auto forwardedUser = [&](std::uint32_t slot) -> std::optional<std::uint32_t> {
+        if (slot >= forwarded.size() || forwarded[slot] >= userData.size() || forwarded[slot] >= entry.userData.size()) return std::nullopt;
+        return forwarded[slot];
+    };
     const auto add = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word, std::uint32_t was, std::uint32_t is) -> bool {
-        const bool addressHigh = kind == FieldKind::Binding && current.bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && word % 4u == 1u;
-        const auto source = findSource(before, now, was, is, addressHigh);
+        const bool exactOnly = kind == FieldKind::Binding;
+        const auto source = findSource(before, now, was, is, exactOnly);
         if (!source) return false;
         Patch patch{kind, binding, word, *source, 0, false};
         patch.overflow = overflows(sourceBase(*source, userData, words, vertex, draw), source->delta);
         patches.push_back(patch);
         return true;
     };
+    for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+        const auto user = forwardedUser(slot);
+        if (!user) continue;
+        if ((static_cast<std::size_t>(slot) + 1u) * sizeof(std::uint32_t) <= current.pushConstants.size() && !covered(FieldKind::Push, 0, slot) && pushWord(previous, slot) == entry.userData[*user] && pushWord(current, slot) == userData[*user]) {
+            patches.push_back({FieldKind::Push, 0, slot, Source{SourceKind::User, *user, 0}, 0, false});
+        }
+        for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
+            const auto& was = previous.bindings[b];
+            const auto& is = current.bindings[b];
+            if (is.role != ShaderRecompiler::DescriptorRole::ShaderData || slot >= is.guestDescriptor.size() || covered(FieldKind::Binding, b, slot)) continue;
+            if (was.guestDescriptor[slot] == entry.userData[*user] && is.guestDescriptor[slot] == userData[*user]) patches.push_back({FieldKind::Binding, b, slot, Source{SourceKind::User, *user, 0}, 0, false});
+        }
+    }
     for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
         const auto& was = previous.bindings[b];
         const auto& is = current.bindings[b];
