@@ -636,11 +636,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<DccKeys> scanned;
     const auto scanKeys = [&] {
+        if (scanned.has_value()) return *scanned;
         const auto scanStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const auto keys = TextureClearKeys(resource, guestBytes);
+        scanned = TextureClearKeys(resource, guestBytes);
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
-        return keys;
+        return *scanned;
     };
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     auto& counters = TextureCounts();
@@ -696,6 +698,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             auto candidate = sampledStorageSource(context, resource, guestBytes);
             if (candidate != nullptr && candidate->Descriptor().dccAddress == resource.dccAddress) source = std::move(candidate);
         }
+        scanned.reset();
         // The lookup's Refresh may have flushed another image's results over the memory (which
         // marks the keys uncompressed): a surface that stays a snapshot re-reads them behind that
         // flush, as it does behind its own. APS5_NO_KEYS_RESCAN=1 keeps the keys scanned above.
@@ -711,15 +714,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         source->Refresh();
+        scanned.reset();
     }
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto observedKeys = keys.has_value() ? *keys : scanKeys();
-    const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
+    const bool stagedClear = source != nullptr && resource.dccAddress != 0 && [&] {
+        const auto observedKeys = keys.has_value() ? *keys : scanKeys();
+        return IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle;
+    }();
     bool stagedFlushed = false;
-    if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    const bool flushAsked = (source == nullptr || stagedClear) && !clearThroughKeys;
+    if (flushAsked && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
         if (stagedClear) {
@@ -730,6 +737,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         if (stagedFlushed) source.reset();
     }
+    if (flushAsked) scanned.reset();
     if (!keys.has_value()) keys = scanKeys();
     if (disabled) {
         if (source != nullptr && depthCompare) {
