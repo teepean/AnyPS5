@@ -39,7 +39,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     std::shared_ptr<const ShaderRecompiler::RecompileResult> fastResult;
     std::vector<ShaderRecompiler::MemoryRegion> fastRegions;
     if (instanceKey != 0) {
-        auto hit = StageInstanceTry(instanceKey, program.userData, vertexInfos[i], shaderMemory);
+        auto hit = StageInstanceTry(instanceKey, program.userData, vertexInfos[i], StageInstanceDrawWords(request), shaderMemory);
         fastRegions = shaderMemory.TakeRecentRegions();
         if (hit) {
             fastResult = hit->compiled;
@@ -135,7 +135,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     if (instanceKey != 0) {
         StageInstanceTimed(0.0, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fullStart).count());
         if (fastResult != nullptr) StageInstanceCompare(instanceKey, program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
-        StageInstanceLearn(instanceKey, program.snapshot, program.userData, vertexInfos[i], *capture, stageCapture.regions, stageCapture.compiled);
+        StageInstanceLearn(instanceKey, program.snapshot, program.userData, vertexInfos[i], StageInstanceDrawWords(request), *capture, stageCapture.regions, stageCapture.compiled);
     }
     if (ShapeCensusEnabled()) ShapeCensusStage(program.binary.codeAddress, program.codeOffset, pushOffset, program.userData, capture, stageCapture.regions, stageCapture.compiled, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - censusStart).count());
     timing.Mark("materialize");
