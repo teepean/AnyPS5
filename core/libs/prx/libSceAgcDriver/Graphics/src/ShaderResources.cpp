@@ -2652,14 +2652,14 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
-    std::array<std::atomic<std::uint64_t>, 16> memo{};
+    std::array<std::atomic<std::uint64_t>, 11> memo{};
     std::atomic<std::uint64_t> memoTaken{0};
     std::atomic<std::uint64_t> memoVerified{0};
     std::atomic<std::uint64_t> memoWrong{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
-constexpr std::array<const char*, 16> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "unwatched", "pending", "image", "key writer", "imports", "ranges", "renewed", "pending exact", "shadowed", "own pending", "allocations", "depth"};
+constexpr std::array<const char*, 11> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges", "renewed"};
 
 bool ProofMemoEnabled() {
     static const bool disabled = std::getenv("APS5_NO_PROOF_MEMO") != nullptr;
@@ -3168,20 +3168,13 @@ std::size_t ShaderResources::proofMemoMiss() {
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     if (memo.epoch == 0 || epoch == 0) return 3;
     const bool renewed = memo.epoch != epoch;
-    if (memo.unwatched != GuestMemory::UnwatchSerial()) return 4;
-    if (memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return 14;
-    if (memo.depthRelevant && memo.depthSurfaces != DepthSurfacesSerial()) return 15;
+    if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || (memo.depthRelevant && memo.depthSurfaces != DepthSurfacesSerial())) return 4;
     const auto pendingSerial = StorageTexture::PendingSerial();
     const bool pendingMoved = pendingSerialSeen == 0 || pendingSerialSeen != pendingSerial;
-    bool ownPending = false;
     if (pendingMoved) {
-        if (memo.pendingExact) return 11;
-        if (!StorageTexture::PendingSurelyClear(memo.pendingRanges)) {
-            if (!StorageTexture::PendingClearExcept(memo.pendingRanges, memo.pendingExcepts)) return 5;
-            ownPending = true;
-        }
+        if (memo.pendingExact || !StorageTexture::PendingSurelyClear(memo.pendingRanges)) return 5;
         for (const auto& [address, bytes] : memo.regionRanges) {
-            if (AnyShadowedOverlaps(address, bytes)) return 12;
+            if (AnyShadowedOverlaps(address, bytes)) return 5;
         }
     }
     for (const auto& [image, version] : memo.images) {
@@ -3204,7 +3197,7 @@ std::size_t ShaderResources::proofMemoMiss() {
     }
     if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return renewed ? 3 : 9;
     if (pendingMoved) pendingSerialSeen = StorageTexture::PendingSerial() == pendingSerial ? pendingSerial : 0;
-    if (!renewed) return ownPending ? 13 : 0;
+    if (!renewed) return 0;
     memo.epoch = epoch;
     return 10;
 }
@@ -3216,7 +3209,6 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     memo.keyRanges.clear();
     memo.images.clear();
     memo.pendingRanges.clear();
-    memo.pendingExcepts.clear();
     memo.regionRanges.clear();
     memo.depthRelevant = !storageTextures.empty();
     memo.pendingExact = false;
@@ -3237,18 +3229,12 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
             continue;
         }
         addSurface(surface.resource.baseAddress, surface.bytes, surface.resource.dccAddress);
-        if (surface.bytes != 0) {
-            memo.pendingRanges.emplace_back(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
-            memo.pendingExcepts.push_back(surface.source);
-        }
+        if (surface.bytes != 0) memo.pendingRanges.emplace_back(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
         if (surface.source == nullptr) continue;
         if (surface.keys != DccKeys::Uncompressed) memo.pendingExact = true;
         const auto& own = surface.source->Descriptor();
         addSurface(own.baseAddress, surface.source->GuestBytes(), own.dccAddress);
-        if (surface.source->GuestBytes() != 0) {
-            memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
-            memo.pendingExcepts.push_back(surface.source);
-        }
+        if (surface.source->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
         memo.images.emplace_back(surface.source, surface.source->Version());
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
@@ -3256,10 +3242,7 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (image == nullptr) return;
         const auto& own = image->Descriptor();
         addSurface(own.baseAddress, image->GuestBytes(), own.dccAddress);
-        if (image->GuestBytes() != 0) {
-            memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-            memo.pendingExcepts.push_back(image);
-        }
+        if (image->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (i < storageKeys.size() && storageKeys[i] != 0 && storageKeys[i] != own.dccAddress) addSurface(0, image->GuestBytes(), storageKeys[i]);
         memo.images.emplace_back(image, image->Version());
     }
@@ -3270,7 +3253,6 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (end > begin) memo.regionRanges.emplace_back(begin, static_cast<std::size_t>(end - begin));
     }
     memo.pendingRanges.insert(memo.pendingRanges.end(), memo.regionRanges.begin(), memo.regionRanges.end());
-    memo.pendingExcepts.resize(memo.pendingRanges.size(), nullptr);
     memo.generation = before.generation;
     memo.epoch = before.epoch;
     memo.unwatched = before.unwatched;
@@ -3301,9 +3283,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto miss = proofMemoMiss();
-    if ((miss == 0 || miss == 10 || miss == 13) && completeCpuWrites()) miss = 2;
+    if ((miss == 0 || miss == 10) && completeCpuWrites()) miss = 2;
     if (profile) Revalidations().memo[miss].fetch_add(1, std::memory_order_relaxed);
-    if (miss == 10 || miss == 13) miss = 0;
+    if (miss == 10) miss = 0;
     if (miss == 0 && !VerifyProofMemo()) {
         if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
         const bool ok = finishProofMemoHit();
