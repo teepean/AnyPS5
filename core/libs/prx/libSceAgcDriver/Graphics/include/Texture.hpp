@@ -230,6 +230,7 @@ public:
     // it was then.
     static std::uint64_t PendingSerial();
     static bool PendingSurelyClear(std::span<const std::pair<std::uint64_t, std::size_t>> ranges);
+    static bool PendingClearExcept(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::span<const StorageTexture* const> excepts);
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);

@@ -4065,6 +4065,24 @@ bool StorageTexture::PendingSurelyClear(std::span<const std::pair<std::uint64_t,
     return pending.flushingCount.load(std::memory_order_acquire) == 0;
 }
 
+bool StorageTexture::PendingClearExcept(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::span<const StorageTexture* const> excepts) {
+    if (excepts.size() != ranges.size()) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto [address, bytes] = ranges[i];
+        if (pending.textures.MayOverlap(address, bytes)) {
+            for (const auto* texture : pending.textures) {
+                if (texture != excepts[i] && texture->overlaps(address, bytes)) return false;
+            }
+        }
+        for (const auto* texture : pending.flushing) {
+            if (texture != excepts[i] && texture->overlaps(address, bytes)) return false;
+        }
+    }
+    return true;
+}
+
 void StorageTexture::NoteProved() const {
     provedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
 }
