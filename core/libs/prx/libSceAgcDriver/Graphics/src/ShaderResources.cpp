@@ -4966,6 +4966,18 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
     return surfaces;
 }
 
+struct ShaderResources::OwnedSets {
+    struct Held {
+        DescriptorCache::SetAllocation allocation;
+        DescriptorCache::SetAllocation fragmentAllocation;
+        std::vector<std::uint32_t> snapshotSlots;
+    };
+    static constexpr std::size_t Limit = 512;
+    std::mutex mutex;
+    std::vector<Held> idle;
+    bool alive = true;
+};
+
 ShaderResources::~ShaderResources() {
     release();
 }
@@ -4987,6 +4999,21 @@ std::shared_ptr<const TableDescriptors> ShaderResources::keptTable(std::size_t s
 }
 
 void ShaderResources::release() noexcept {
+    if (ownedSets != nullptr) {
+        std::vector<OwnedSets::Held> idle;
+        {
+            std::lock_guard lock(ownedSets->mutex);
+            ownedSets->alive = false;
+            idle.swap(ownedSets->idle);
+        }
+        if (context.descriptorCache != nullptr) {
+            for (const auto& held : idle) {
+                if (held.allocation.set != VK_NULL_HANDLE) context.descriptorCache->Recycle(_layout, held.allocation);
+                if (held.fragmentAllocation.set != VK_NULL_HANDLE) context.descriptorCache->Recycle(fragment.layout, held.fragmentAllocation);
+            }
+        }
+        ownedSets.reset();
+    }
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
     std::shared_ptr<const std::vector<std::shared_ptr<Texture>>> held;
     if (cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(cacheAllocation, keptTable(0, held));
@@ -5025,6 +5052,13 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
 
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
+    if (owner != nullptr) {
+        std::lock_guard lock(owner->mutex);
+        if (owner->alive && owner->idle.size() < OwnedSets::Limit) {
+            owner->idle.push_back({std::move(allocation), std::move(fragmentAllocation), std::move(snapshotSlots)});
+            return;
+        }
+    }
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
@@ -5252,63 +5286,111 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
-    for (auto& sizes : counts) sizes.clear();
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        described[set] = true;
-        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-        if (count == 0) continue;
-        auto& sizes = counts[set];
-        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (held != sizes.end()) held->descriptorCount += count;
-        else sizes.push_back({binding.layout.descriptorType, count});
-    }
-    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
-    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
-    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
-    if (described[0] || splitSets) {
-        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
-        result->layout = _layout;
-        Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    }
-    if (described[1] || splitSets) {
-        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
-        result->fragmentLayout = fragment.layout;
-        Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    if (bufferSlots.size() != descriptorBuffers.size() || allocationOffsets.size() != allocations.size()) {
+        bufferSlots.assign(descriptorBuffers.size(), BufferSlot{0, 0, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
+        allocationOffsets.assign(allocations.size(), {});
+        auto nextWrite = descriptorWrites.begin();
+        for (const auto& binding : bindings) {
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            while (nextWrite != descriptorWrites.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
+                const auto& write = *nextWrite++;
+                if (binding.allocations.empty()) continue;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                    bufferSlots[offset + element] = {setOf(binding), write.dstBinding, write.dstArrayElement + static_cast<std::uint32_t>(element), write.descriptorType};
+                    allocationOffsets[binding.allocations[element]].push_back(static_cast<std::uint32_t>(offset + element));
+                }
+            }
+        }
+        Require(nextWrite == descriptorWrites.end(), "draw snapshot writes disagree with their descriptor bindings");
     }
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
-    writes = descriptorWrites;
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
-    snapshotIndices.assign(allocations.size(), selected.size());
-    for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
-    auto nextWrite = writes.begin();
-    for (const auto& binding : bindings) {
-        const auto original = setOf(binding) == 0 ? _set : fragment.set;
-        while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
-            auto& write = *nextWrite++;
-            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
-            if (binding.allocations.empty()) continue;
-            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
-            write.pBufferInfo = buffers.data() + offset;
-            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
-                const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
-            }
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result->snapshots[index];
+        for (const auto offset : allocationOffsets[selected[index]]) {
+            buffers[offset] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+            result->snapshotSlots.push_back(offset);
         }
     }
-    Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
-    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    std::optional<OwnedSets::Held> reused;
+    if (ownedSets == nullptr) {
+        ownedSets = std::make_shared<OwnedSets>();
+    } else {
+        std::lock_guard lock(ownedSets->mutex);
+        if (!ownedSets->idle.empty()) {
+            reused = std::move(ownedSets->idle.back());
+            ownedSets->idle.pop_back();
+        }
+    }
+    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
+    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    if (reused) {
+        result->allocation = std::move(reused->allocation);
+        result->fragmentAllocation = std::move(reused->fragmentAllocation);
+        if (result->allocation.set != VK_NULL_HANDLE) result->layout = _layout;
+        if (result->fragmentAllocation.set != VK_NULL_HANDLE) result->fragmentLayout = fragment.layout;
+        writes.clear();
+        const auto rewrite = [&](std::uint32_t offset) {
+            const auto& slot = bufferSlots[offset];
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = slot.set == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            write.dstBinding = slot.binding;
+            write.dstArrayElement = slot.element;
+            write.descriptorCount = 1;
+            write.descriptorType = slot.type;
+            write.pBufferInfo = buffers.data() + offset;
+            writes.push_back(write);
+        };
+        for (const auto offset : result->snapshotSlots) rewrite(offset);
+        for (const auto offset : reused->snapshotSlots) {
+            if (std::find(result->snapshotSlots.begin(), result->snapshotSlots.end(), offset) == result->snapshotSlots.end()) rewrite(offset);
+        }
+    } else {
+        std::array<bool, 2> described{};
+        thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
+        auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+        for (auto& sizes : counts) sizes.clear();
+        for (const auto& binding : bindings) {
+            const auto set = setOf(binding);
+            described[set] = true;
+            const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+            if (count == 0) continue;
+            auto& sizes = counts[set];
+            const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+            if (held != sizes.end()) held->descriptorCount += count;
+            else sizes.push_back({binding.layout.descriptorType, count});
+        }
+        for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+        const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
+        const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+        if (described[0] || splitSets) {
+            result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+            result->layout = _layout;
+            Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        }
+        if (described[1] || splitSets) {
+            result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+            result->fragmentLayout = fragment.layout;
+            Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        }
+        writes = descriptorWrites;
+        auto nextWrite = writes.begin();
+        for (const auto& binding : bindings) {
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
+                auto& write = *nextWrite++;
+                write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+                if (binding.allocations.empty()) continue;
+                write.pBufferInfo = buffers.data() + (write.pBufferInfo - descriptorBuffers.data());
+            }
+        }
+        Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    }
+    if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    result->owner = ownedSets;
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;

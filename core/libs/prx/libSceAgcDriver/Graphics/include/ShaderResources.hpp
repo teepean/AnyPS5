@@ -175,6 +175,7 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    struct OwnedSets;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -192,6 +193,8 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<OwnedSets> owner;
+        std::vector<std::uint32_t> snapshotSlots;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -586,6 +589,15 @@ private:
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    struct BufferSlot {
+        std::uint32_t set;
+        std::uint32_t binding;
+        std::uint32_t element;
+        VkDescriptorType type;
+    };
+    mutable std::vector<BufferSlot> bufferSlots;
+    mutable std::vector<std::vector<std::uint32_t>> allocationOffsets;
+    mutable std::shared_ptr<OwnedSets> ownedSets;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
