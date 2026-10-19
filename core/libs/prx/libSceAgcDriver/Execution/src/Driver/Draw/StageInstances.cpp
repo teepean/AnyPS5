@@ -263,22 +263,22 @@ struct Inputs {
     const Draw* draw;
 };
 
-std::optional<Source> findSource(const Inputs& before, const Inputs& now, std::uint32_t previous, std::uint32_t current, bool exactOnly) {
+std::optional<Source> findSource(const Inputs& before, const Inputs& now, std::uint32_t previous, std::uint32_t current, bool exactOnly, bool readWordsOnly = false) {
     const auto vertexCount = std::min(vertexWords(*before.vertex), vertexWords(*now.vertex));
     for (int pass = 0; pass < (exactOnly ? 1 : 2); ++pass) {
         const auto matches = [&](std::uint32_t was, std::uint32_t is) {
             if (pass == 0) return was == previous && is == current;
             return was != is && current - is == previous - was;
         };
-        for (std::uint32_t u = 0; u < now.userData.size() && u < before.userData.size(); ++u) {
+        for (std::uint32_t u = 0; !readWordsOnly && u < now.userData.size() && u < before.userData.size(); ++u) {
             if (matches(before.userData[u], now.userData[u])) return Source{SourceKind::User, u, current - now.userData[u]};
         }
-        for (std::uint32_t v = 0; v < vertexCount; ++v) {
+        for (std::uint32_t v = 0; !readWordsOnly && v < vertexCount; ++v) {
             const auto was = vertexWord(**before.vertex, v);
             const auto is = vertexWord(**now.vertex, v);
             if (matches(was, is)) return Source{SourceKind::Vertex, v, current - is};
         }
-        for (std::uint32_t d = 0; d < DrawWords; ++d) {
+        for (std::uint32_t d = 0; !readWordsOnly && d < DrawWords; ++d) {
             if (matches((*before.draw)[d], (*now.draw)[d])) return Source{SourceKind::Draw, d, current - (*now.draw)[d]};
         }
         for (std::uint32_t w = 0; w < now.words.size() && w < before.words.size(); ++w) {
@@ -395,7 +395,9 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
                     patches.push_back({FieldKind::Address, b, e, *source, 0, false});
                 }
                 if (x[2] != y[2] && !covered(FieldKind::Binding, b, e * 4u + 2u)) {
-                    if (!add(FieldKind::Binding, b, e * 4u + 2u, x[2], y[2])) return FailNoSource;
+                    const auto source = findSource(before, now, x[2], y[2], true, true);
+                    if (!source) return FailNoSource;
+                    patches.push_back({FieldKind::Binding, b, e * 4u + 2u, *source, 0, false});
                 }
             }
             continue;
