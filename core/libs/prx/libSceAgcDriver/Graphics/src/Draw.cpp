@@ -781,9 +781,18 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+void appendShaderKeys(std::span<const CompiledShader> shaders, std::vector<std::uint32_t>& key) {
+    for (const auto& shader : shaders) {
+        const auto at = key.size();
+        key.push_back(0);
+        ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
+        key[at] = static_cast<std::uint32_t>(key.size() - at - 1);
+    }
+}
+
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, const std::vector<std::uint32_t>* shaderKey = nullptr) {
     ResourceCache::Key key;
-    key.reserve(256);
+    key.reserve(shaderKey != nullptr ? shaderKey->size() + 16 : 256);
     key.push_back(0xffffffffu);
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
@@ -791,12 +800,8 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     };
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
-    for (const auto& shader : shaders) {
-        const auto at = key.size();
-        key.push_back(0);
-        ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
-        key[at] = static_cast<std::uint32_t>(key.size() - at - 1);
-    }
+    if (shaderKey != nullptr) key.insert(key.end(), shaderKey->begin(), shaderKey->end());
+    else appendShaderKeys(shaders, key);
     key.push_back(colorAttachments);
     if (ranges) {
         append64(target.address | target.pipeBankXor);
@@ -1532,7 +1537,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const RepeatedDraw* repeat = nullptr) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const RepeatedDraw* repeat = nullptr, const std::vector<std::uint32_t>* shaderKey = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1548,7 +1553,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, shaderKey);
         std::shared_ptr<ShaderResources> repeated;
         if (repeat != nullptr && repeat->key == resolved.contentKey && SharedResourceCache().Modifications() == repeat->cacheModifications) repeated = repeat->resources.lock();
         outcome.repeatedTemplate = repeated != nullptr;
@@ -2252,6 +2257,22 @@ void SetDrawRepeatHint(std::uint64_t sequence, std::uint64_t repeatOf) {
     drawRepeatHint = {sequence, repeatOf};
 }
 
+thread_local std::vector<std::uint32_t> drawShaderKeyHint;
+thread_local std::uint64_t drawShaderKeySequence = 0;
+
+std::vector<std::uint32_t> DrawShaderKey(std::span<const CompiledShader> shaders) {
+    std::vector<std::uint32_t> key;
+    if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr || shader.program->PipelineVariantId() == 0; })) return key;
+    key.reserve(256);
+    appendShaderKeys(shaders, key);
+    return key;
+}
+
+void SetDrawShaderKeyHint(std::vector<std::uint32_t> shaderKey, std::uint64_t sequence) {
+    drawShaderKeyHint = std::move(shaderKey);
+    drawShaderKeySequence = drawShaderKeyHint.empty() ? 0 : sequence;
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
@@ -2294,6 +2315,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto& last = lastDraw();
     const bool lastValid = std::exchange(last.valid, false);
     const auto hint = std::exchange(drawRepeatHint, RepeatHint{});
+    const bool shaderKeyHinted = hint.sequence != 0 && std::exchange(drawShaderKeySequence, 0) == hint.sequence;
+    const auto shaderKeyHint = shaderKeyHinted ? std::move(drawShaderKeyHint) : std::vector<std::uint32_t>{};
     outcome.repeatHinted = hint.repeatOf != 0;
     const std::uint64_t chain = hint.sequence == 0 ? 0 : outcome.repeatHinted && lastValid && hint.repeatOf == last.sequence ? last.chain : hint.sequence;
     bool repeat = outcome.repeatHinted && lastValid && hint.repeatOf == last.sequence && last.device == context.device && last.recorder == Recorder::Active() && stencilReferences.empty() && !state.quadList && !draw.indirect && last.owners.size() == state.colors.size() && DumpTargetLimit() == 0;
@@ -2469,7 +2492,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     outcome.repeatedTargets = repeat && !state.colors.empty();
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, repeat ? &last : nullptr);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, repeat ? &last : nullptr, shaderKeyHinted ? &shaderKeyHint : nullptr);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
