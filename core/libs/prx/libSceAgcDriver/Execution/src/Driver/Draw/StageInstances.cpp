@@ -71,8 +71,16 @@ struct Entry {
     bool retired = false;
     bool ready = false;
     std::uint32_t stable = 0;
+    std::uint64_t imageSignature = 0;
+};
+
+constexpr std::size_t Variants = 4;
+
+struct Shape {
+    std::vector<std::shared_ptr<const Entry>> variants;
     std::uint32_t failures = 0;
     bool everLearned = false;
+    bool retired = false;
     mutable std::uint32_t skip = 0;
 };
 
@@ -100,6 +108,8 @@ struct Counters {
     std::uint64_t retired = 0;
     std::uint64_t skippedLearns = 0;
     std::uint64_t recycled = 0;
+    std::uint64_t otherVariant = 0;
+    std::uint64_t newVariants = 0;
     std::uint64_t fastTimed = 0;
     double fastUs = 0.0;
     std::uint64_t fullTimed = 0;
@@ -108,7 +118,7 @@ struct Counters {
 
 struct State {
     std::mutex mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<const Entry>> entries;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const Shape>> shapes;
     Counters counters;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
@@ -211,6 +221,18 @@ bool imageRole(ShaderRecompiler::DescriptorRole role) {
 
 std::size_t vertexWords(const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
     return vertex.has_value() ? static_cast<std::size_t>(std::min(vertex->resourcesNum, ShaderRecompiler::ShaderVertexStageInfo::MaxResources)) * 4u : 0u;
+}
+
+std::uint64_t imageSignature(const ShaderRecompiler::RecompileResult& result) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (std::uint32_t b = 0; b < result.bindings.size(); ++b) {
+        const auto& binding = result.bindings[b];
+        if (!imageRole(binding.role)) continue;
+        mix(hash, b);
+        mix(hash, binding.guestDescriptor.size());
+        for (const auto word : binding.guestDescriptor) mix(hash, word);
+    }
+    return hash;
 }
 
 std::uint32_t sourceValue(const Source& source, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> words, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw) {
@@ -513,9 +535,9 @@ void report(State& value) {
         std::snprintf(piece, sizeof(piece), " %s %llu", LearnFailNames[f], static_cast<unsigned long long>(c.failed[f]));
         line += piece;
     }
-    std::snprintf(piece, sizeof(piece), "; self-checks %llu, shapes retired %llu, learnings skipped %llu", static_cast<unsigned long long>(c.checks), static_cast<unsigned long long>(c.retired), static_cast<unsigned long long>(c.skippedLearns));
+    std::snprintf(piece, sizeof(piece), "; self-checks %llu, shapes retired %llu, learnings skipped %llu; hits from an older variant %llu, variants started %llu", static_cast<unsigned long long>(c.checks), static_cast<unsigned long long>(c.retired), static_cast<unsigned long long>(c.skippedLearns), static_cast<unsigned long long>(c.otherVariant), static_cast<unsigned long long>(c.newVariants));
     line += piece;
-    std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions (patched %llu, unpatched %llu, shape %llu); fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), static_cast<unsigned long long>(c.mismatchedPatched), static_cast<unsigned long long>(c.mismatchedUnpatched), static_cast<unsigned long long>(c.mismatchedShape), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
+    std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions (patched %llu, unpatched %llu, shape %llu); fast %.2f us per hit, full %.2f us per capture; %zu shapes", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), static_cast<unsigned long long>(c.mismatchedPatched), static_cast<unsigned long long>(c.mismatchedUnpatched), static_cast<unsigned long long>(c.mismatchedShape), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.shapes.size());
     line += piece;
     std::fprintf(stderr, "%s\n", line.c_str());
     c = Counters{};
@@ -599,55 +621,52 @@ std::uint64_t StageInstanceKey(const void* shader, std::uint64_t codeAddress, st
     return hash != 0 ? hash : 1;
 }
 
-std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
-    if (key == 0) return std::nullopt;
-    const auto started = std::chrono::steady_clock::now();
-    auto& value = state();
-    std::shared_ptr<const Entry> held;
-    {
-        std::lock_guard lock(value.mutex);
-        ++value.counters.lookups;
-        const auto found = value.entries.find(key);
-        if (found != value.entries.end()) held = found->second;
-    }
-    const auto missed = [&](Miss reason) -> std::optional<StageInstanceHit> {
-        std::lock_guard lock(value.mutex);
-        ++value.counters.misses[reason];
-        return std::nullopt;
+namespace {
+
+struct Attempt {
+    std::optional<StageInstanceHit> hit;
+    Miss miss = MissNoEntry;
+    bool changed = false;
+    bool recycled = false;
+};
+
+Attempt attempt(const Entry& entry, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
+    Attempt outcome;
+    const auto fail = [&](Miss reason) {
+        outcome.miss = reason;
+        return outcome;
     };
-    if (held == nullptr) return missed(MissNoEntry);
-    const auto& entry = *held;
-    if (entry.blocked) return missed(MissBlocked);
-    if (!entry.learned) return missed(MissNotLearned);
-    if (!entry.ready) return missed(MissNotReady);
-    if (entry.userData.size() != userData.size()) return missed(MissUser);
+    if (entry.blocked) return fail(MissBlocked);
+    if (!entry.learned) return fail(MissNotLearned);
+    if (!entry.ready) return fail(MissNotReady);
+    if (entry.userData.size() != userData.size()) return fail(MissUser);
     for (std::size_t u = 0; u < userData.size(); ++u) {
-        if (userData[u] != entry.userData[u] && (!entry.userObserved[u] || entry.userPinned[u])) return missed(MissUser);
+        if (userData[u] != entry.userData[u] && (!entry.userObserved[u] || entry.userPinned[u])) return fail(MissUser);
     }
     for (const auto& run : entry.runs) {
         if (run.origin < 0) continue;
         const auto now = userData[static_cast<std::size_t>(run.origin)];
         const auto was = entry.userData[static_cast<std::size_t>(run.origin)];
-        if (now == 0 || ((now ^ was) & 3u) != 0) return missed(MissPointerFlags);
+        if (now == 0 || ((now ^ was) & 3u) != 0) return fail(MissPointerFlags);
     }
-    if (entry.vertex.has_value() != vertex.has_value() || vertexWords(entry.vertex) != vertexWords(vertex)) return missed(MissVertex);
+    if (entry.vertex.has_value() != vertex.has_value() || vertexWords(entry.vertex) != vertexWords(vertex)) return fail(MissVertex);
     for (std::size_t v = 0; v < vertexWords(vertex); ++v) {
         const auto is = vertexWord(*vertex, static_cast<std::uint32_t>(v));
         const auto was = vertexWord(*entry.vertex, static_cast<std::uint32_t>(v));
-        if (is != was && (v % 4u == 3u || !entry.vertexObserved[v])) return missed(MissVertex);
+        if (is != was && (v % 4u == 3u || !entry.vertexObserved[v])) return fail(MissVertex);
     }
     for (std::size_t d = 0; d < DrawWords; ++d) {
-        if (draw[d] != entry.draw[d] && !entry.drawObserved[d]) return missed(MissDraw);
+        if (draw[d] != entry.draw[d] && !entry.drawObserved[d]) return fail(MissDraw);
     }
     thread_local std::vector<std::uint32_t> scratch;
     scratch.assign(entry.words.size(), 0u);
     auto& words = scratch;
     for (const auto& run : entry.runs) {
         const auto address = run.origin >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(run.origin)])) + run.at : run.at;
-        if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return missed(MissRead);
+        if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return fail(MissRead);
     }
     for (std::size_t w = 0; w < words.size(); ++w) {
-        if (words[w] != entry.words[w] && !entry.wordObserved[w]) return missed(MissWord);
+        if (words[w] != entry.words[w] && !entry.wordObserved[w]) return fail(MissWord);
     }
     bool changed = false;
     for (const auto& patch : entry.patches) {
@@ -655,7 +674,7 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
             if (addressValue(patch.source, userData, words, vertex, draw) != addressOf(entry.result->bindings[patch.binding], patch.word)) changed = true;
             continue;
         }
-        if (patch.source.delta != 0 && overflows(sourceBase(patch.source, userData, words, vertex, draw), patch.source.delta) != patch.overflow) return missed(MissCarry);
+        if (patch.source.delta != 0 && overflows(sourceBase(patch.source, userData, words, vertex, draw), patch.source.delta) != patch.overflow) return fail(MissCarry);
         if (sourceValue(patch.source, userData, words, vertex, draw) != fieldValue(*entry.result, patch)) changed = true;
     }
     for (const auto& attribute : entry.result->vertexAttributes) {
@@ -687,67 +706,116 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
         }
         hit.compiled = std::move(result);
     }
-    const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+    outcome.hit = std::move(hit);
+    outcome.changed = changed;
+    outcome.recycled = recycled;
+    return outcome;
+}
+
+}
+
+std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
+    if (key == 0) return std::nullopt;
+    const auto started = std::chrono::steady_clock::now();
+    auto& value = state();
+    std::shared_ptr<const Shape> held;
+    {
+        std::lock_guard lock(value.mutex);
+        ++value.counters.lookups;
+        const auto found = value.shapes.find(key);
+        if (found != value.shapes.end()) held = found->second;
+    }
+    std::optional<Miss> first;
+    for (std::size_t v = 0; held != nullptr && v < held->variants.size(); ++v) {
+        auto outcome = attempt(*held->variants[v], userData, vertex, draw, memory);
+        if (!outcome.hit) {
+            if (!first) first = outcome.miss;
+            continue;
+        }
+        outcome.hit->variant = held->variants[v];
+        const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        std::lock_guard lock(value.mutex);
+        auto& c = value.counters;
+        if (outcome.changed) c.patchedWords += held->variants[v]->patches.size();
+        else ++c.shared;
+        if (outcome.recycled) ++c.recycled;
+        if (outcome.hit->check) ++c.checks;
+        if (v != 0) ++c.otherVariant;
+        ++c.hits;
+        ++c.fastTimed;
+        c.fastUs += elapsed;
+        return std::move(outcome.hit);
+    }
     std::lock_guard lock(value.mutex);
-    auto& c = value.counters;
-    if (changed) c.patchedWords += entry.patches.size();
-    else ++c.shared;
-    if (recycled) ++c.recycled;
-    if (hit.check) ++c.checks;
-    ++c.hits;
-    ++c.fastTimed;
-    c.fastUs += elapsed;
-    return hit;
+    ++value.counters.misses[first.value_or(MissNoEntry)];
+    return std::nullopt;
 }
 
 void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& shader, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, const ShaderRecompiler::ResourceCapture& capture, std::span<const ShaderRecompiler::MemoryRegion> regions, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
     if (compiled == nullptr || key == 0) return;
-    std::vector<std::uint32_t> words;
-    auto runs = relativeRuns(userData, capture.userDataUse, regions, words);
     auto& value = state();
-    std::shared_ptr<const Entry> previous;
+    std::shared_ptr<const Shape> shape;
     {
         std::lock_guard lock(value.mutex);
-        const auto found = value.entries.find(key);
-        if (found != value.entries.end()) previous = found->second;
-        if (previous != nullptr && previous->skip != 0 && previous->shader == shader) {
-            --previous->skip;
+        const auto found = value.shapes.find(key);
+        if (found != value.shapes.end()) shape = found->second;
+        if (shape != nullptr && shape->skip != 0 && !shape->variants.empty() && shape->variants.front()->shader == shader) {
+            --shape->skip;
             ++value.counters.skippedLearns;
             return;
         }
     }
+    std::vector<std::uint32_t> words;
+    auto runs = relativeRuns(userData, capture.userDataUse, regions, words);
+    const auto signature = imageSignature(*compiled);
+    std::shared_ptr<const Entry> previous;
+    for (std::size_t v = 0; shape != nullptr && v < shape->variants.size(); ++v) {
+        const auto& candidate = shape->variants[v];
+        if (candidate->shader == shader && candidate->result != nullptr && candidate->imageSignature == signature) {
+            previous = candidate;
+            break;
+        }
+    }
+    const bool retired = shape != nullptr && shape->retired;
     auto entry = std::make_shared<Entry>();
     std::optional<LearnFail> failure;
-    const bool comparable = previous != nullptr && previous->result != nullptr && previous->shader == shader;
+    const bool comparable = previous != nullptr;
     if (comparable) {
-        entry->retired = previous->retired;
         failure = learn(*previous, *entry, runs, words, userData, vertex, draw, *compiled);
         entry->learned = !failure.has_value();
         entry->stable = failure ? 0u : previous->stable + 1u;
-        entry->failures = failure ? previous->failures + 1u : 0u;
-        entry->everLearned = previous->everLearned || !failure.has_value();
-        entry->skip = failure && !entry->everLearned && entry->failures >= 3u ? std::min(32u, 1u << std::min(entry->failures - 2u, 5u)) : 0u;
         if (failure) entry->patches.clear();
     }
+    entry->retired = retired;
+    entry->imageSignature = signature;
     const auto& snapshot = capture.snapshot;
     entry->blocked = entry->retired || !snapshot.tables.tables.empty() || !snapshot.tables.ranges.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0;
     store(*entry, comparable && !failure.has_value(), shader, std::move(runs), std::move(words), userData, vertex, draw, capture.userDataUse, compiled);
+    auto next = std::make_shared<Shape>();
+    next->variants.reserve(Variants);
+    next->variants.push_back(entry);
+    for (std::size_t v = 0; shape != nullptr && v < shape->variants.size() && next->variants.size() < Variants; ++v) {
+        const auto& kept = shape->variants[v];
+        if (kept != previous && kept->shader == shader) next->variants.push_back(kept);
+    }
+    const bool learnedNow = comparable && !failure.has_value();
+    next->retired = retired;
+    next->everLearned = (shape != nullptr && shape->everLearned) || learnedNow;
+    next->failures = learnedNow ? 0u : (shape != nullptr ? shape->failures + 1u : 0u);
+    next->skip = !next->everLearned && next->failures >= 3u ? std::min(32u, 1u << std::min(next->failures - 2u, 5u)) : 0u;
     std::lock_guard lock(value.mutex);
     if (comparable) {
         if (failure) ++value.counters.failed[*failure];
         else ++value.counters.learned;
+    } else if (shape != nullptr && !shape->variants.empty()) {
+        ++value.counters.newVariants;
     }
-    value.entries[key] = std::move(entry);
+    value.shapes[key] = std::move(next);
 }
 
-void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
+void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& variant, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
     auto& value = state();
-    std::shared_ptr<const Entry> held;
-    {
-        std::lock_guard lock(value.mutex);
-        const auto found = value.entries.find(key);
-        if (found != value.entries.end()) held = found->second;
-    }
+    const auto held = std::static_pointer_cast<const Entry>(variant);
     const auto patchFor = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word) -> const Patch* {
         if (held == nullptr) return nullptr;
         for (const auto& patch : held->patches) {
@@ -812,13 +880,21 @@ void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const Sh
         return flat;
     };
     const bool sameRegions = flatten(fastRegions) == flatten(fullRegions);
-    if (!StageInstancesVerify() && (kind != Kind::Same || !sameRegions) && held != nullptr) {
-        auto retired = std::make_shared<Entry>(*held);
-        retired->blocked = true;
-        retired->retired = true;
-        retired->ready = false;
+    if (!StageInstancesVerify() && (kind != Kind::Same || !sameRegions)) {
         std::lock_guard lock(value.mutex);
-        value.entries[key] = std::move(retired);
+        const auto found = value.shapes.find(key);
+        if (found != value.shapes.end()) {
+            auto retired = std::make_shared<Shape>(*found->second);
+            retired->retired = true;
+            for (auto& kept : retired->variants) {
+                auto blocked = std::make_shared<Entry>(*kept);
+                blocked->blocked = true;
+                blocked->retired = true;
+                blocked->ready = false;
+                kept = std::move(blocked);
+            }
+            found->second = std::move(retired);
+        }
         ++value.counters.retired;
     }
     {

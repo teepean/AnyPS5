@@ -37,12 +37,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.pushOffset = pushOffset;
     const auto instanceKey = StageInstancesEnabled() && dumpTarget == 0 && dumpSlot1 == 0 ? StageInstanceKey(program.snapshot.get(), program.binary.codeAddress, program.codeOffset, request) : 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> fastResult;
+    std::shared_ptr<const void> fastVariant;
     std::vector<ShaderRecompiler::MemoryRegion> fastRegions;
     if (instanceKey != 0) {
         auto hit = StageInstanceTry(instanceKey, program.userData, vertexInfos[i], StageInstanceDrawWords(request), shaderMemory);
         fastRegions = shaderMemory.TakeRecentRegions();
         if (hit) {
             fastResult = hit->compiled;
+            fastVariant = hit->variant;
             if (!StageInstancesVerify() && !hit->check) {
                 stageCapture.regions = std::move(fastRegions);
                 stageCapture.supplied = shaderMemory.SuppliedBlocks();
@@ -134,7 +136,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.capture = capture;
     if (instanceKey != 0) {
         StageInstanceTimed(0.0, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fullStart).count());
-        if (fastResult != nullptr) StageInstanceCompare(instanceKey, program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
+        if (fastResult != nullptr) StageInstanceCompare(instanceKey, fastVariant, program.binary.codeAddress, *fastResult, fastRegions, *stageCapture.compiled, stageCapture.regions);
         StageInstanceLearn(instanceKey, program.snapshot, program.userData, vertexInfos[i], StageInstanceDrawWords(request), *capture, stageCapture.regions, stageCapture.compiled);
     }
     if (ShapeCensusEnabled()) ShapeCensusStage(program.binary.codeAddress, program.codeOffset, pushOffset, program.userData, capture, stageCapture.regions, stageCapture.compiled, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - censusStart).count());
