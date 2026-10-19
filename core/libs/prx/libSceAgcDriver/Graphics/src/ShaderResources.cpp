@@ -3091,6 +3091,15 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+namespace {
+
+bool AnyPendingCpuWrites(const Context& context) {
+    if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+    return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
+}
+
+}
+
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
@@ -3125,14 +3134,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    for (const auto& range : describedRanges) {
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
-    }
-    for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    if (AnyPendingCpuWrites(context)) {
+        for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        for (const auto& range : describedRanges) {
+            CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+            if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+            if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        }
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
