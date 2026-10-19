@@ -3025,6 +3025,44 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+    constexpr std::size_t copiedBytes = 64u << 10u;
+#ifdef _WIN32
+    auto* copied = static_cast<std::byte*>(VirtualAlloc(nullptr, copiedBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* copied = static_cast<std::byte*>(std::aligned_alloc(65536, copiedBytes));
+#endif
+    Require(copied != nullptr, "cannot allocate the copied staging block");
+    std::memset(copied, 0x11, copiedBytes);
+    const auto element = reinterpret_cast<std::uint64_t>(copied);
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, copiedBytes, false, false);
+        memory.Upload(false);
+        Require(memory.StagedRegions() == 1 && memory.InPlaceReads().empty(), "a written element outside the host imports was not staged");
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, copiedBytes, adjustment);
+        Require(adjustment == 0, "the staged copy's view is not aligned to its element");
+        {
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset, 4096, 0x22222222u);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        memory.RecordCopyBacks(recorder);
+        Require(memory.HasCopiedWrites(), "a staged CPU copy was counted as written back by the GPU");
+        copied[copiedBytes - 1] = std::byte{0x33};
+        recorder.Sync();
+        memory.WriteBack();
+    }
+    Require(std::all_of(copied, copied + 4096, [](std::byte value) { return value == std::byte{0x22}; }), "the GPU's stores into a staged CPU copy did not reach guest memory");
+    Require(std::all_of(copied + 4096, copied + copiedBytes - 1, [](std::byte value) { return value == std::byte{0x11}; }), "a staged CPU copy's write-back changed bytes the GPU left alone");
+    Require(copied[copiedBytes - 1] == std::byte{0x33}, "a staged CPU copy's write-back rolled back a CPU store");
+#ifdef _WIN32
+    VirtualFree(copied, 0, MEM_RELEASE);
+#else
+    std::free(copied);
+#endif
     return true;
 }
 

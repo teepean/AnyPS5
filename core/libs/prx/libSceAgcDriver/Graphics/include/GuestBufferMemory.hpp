@@ -314,6 +314,9 @@ public:
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
         return bytes;
     }
+    std::size_t StagedRegions() const {
+        return static_cast<std::size_t>(std::count_if(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal; }));
+    }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
@@ -380,6 +383,7 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        std::shared_ptr<Buffer> host {};
         bool copiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;

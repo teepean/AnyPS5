@@ -192,6 +192,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_CLEARED_VIEW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | keeps fast-cleared surfaces as CPU snapshots instead of viewing the cleared storage image |
 | `APS5_NO_COLLECT_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | disables the per-thread memo of write-watch collects |
 | `APS5_NO_CONTEXT_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | rebuilds the Graphics::Context on every call instead of returning the cached one |
+| `APS5_NO_COPIED_SHADOW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | binds written staging elements outside host imports through their CPU copy instead of a device-local shadow |
 | `APS5_NO_COPY_ALIAS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | keeps every device copy a transfer instead of aliasing the source storage image |
 | `APS5_NO_COPY_HLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` |  | disables the copy-kernel HLE, so matching copies run as compute |
 | `APS5_NO_COPY_KNOWN_VALUES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` |  | disables serving a copy's destination from source values the driver already knows |

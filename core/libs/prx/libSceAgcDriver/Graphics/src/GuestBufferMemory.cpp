@@ -3893,6 +3893,11 @@ bool atomicStagingEnabled() {
     return !disabled;
 }
 
+bool copiedShadowEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_COPIED_SHADOW") != nullptr;
+    return !disabled;
+}
+
 std::uint64_t kibSetting(const char* name, std::uint64_t defaultKib) {
     const char* value = std::getenv(name);
     return (value != nullptr ? std::strtoull(value, nullptr, 10) : defaultKib) << 10u;
@@ -3937,6 +3942,7 @@ struct CopyStats {
     // (counted when the build is reused or destroyed), and shadows the device refused.
     std::atomic<std::uint64_t> staged{0};
     std::atomic<std::uint64_t> stagedAtomic{0};
+    std::atomic<std::uint64_t> stagedCopied{0};
     std::atomic<std::uint64_t> stagedReused{0};
     std::atomic<std::uint64_t> stagedInBytes{0};
     std::atomic<std::uint64_t> stagedOutBytes{0};
@@ -3986,7 +3992,7 @@ void reportStaging() {
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds, %llu from CPU copies), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), static_cast<unsigned long long>(stats.stagedCopied.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -4401,9 +4407,20 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.buffer.reset();
             region.deviceLocal = false;
         }
+        const bool stageCopy = recorder != nullptr && region.writable && copiedShadowEnabled() && stagingEligible(region, addressable);
+        if (stageCopy) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
+        if (!stageCopy) continue;
+        auto shadow = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+        if (shadow == nullptr) continue;
+        region.host = std::exchange(region.buffer, std::move(shadow));
+        region.copySource = region.host->Handle();
+        region.copySourceBase = region.begin;
+        region.gpuCopy = true;
+        region.deviceLocal = true;
+        gpuCopies.push_back(&region);
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
@@ -4603,12 +4620,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr && region->host == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
         // source is a live import or one retireImport already handed to this batch.
         recorder->Keep(region->buffer);
+        if (region->host != nullptr) recorder->Keep(region->host);
         region->snapshot.clear();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
         if (profile) {
@@ -4619,6 +4637,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
                 Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+                if (region->host != nullptr) Copies().stagedCopied.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -4672,6 +4691,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
+            if (region.host != nullptr) recorder.Keep(region.host);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
                 Copies().gpuCopyBackBytes.fetch_add(to - from, std::memory_order_relaxed);
@@ -4906,7 +4926,7 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         // write; until RecordCopyBacks ran it still counts (a use without it stores in WriteBack).
         // A staged copy never counts: its use always records the copy-back (AllowDeviceStaging),
         // and nothing could be stored from it by the CPU.
-        if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
+        if (region.gpuCopy && region.host == nullptr && (region.copiedBack || region.deviceLocal)) continue;
         // Writes into a read-only image mirror are never stored (its pages could not take them).
         if (region.mirror != nullptr && !region.mirror->writable) continue;
         return true;
@@ -4922,7 +4942,7 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr) continue;
-        if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
+        if (region.gpuCopy && region.host == nullptr && (region.copiedBack || region.deviceLocal)) continue;
         if (region.mirror != nullptr && !region.mirror->writable) continue;
         return true;
     }
@@ -4934,7 +4954,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
-        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack && region.host == nullptr)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
     }
 }
 
@@ -5019,7 +5039,7 @@ void GuestBufferMemory::WriteBack() {
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
-        if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct == nullptr && !(region.gpuCopy && region.host == nullptr && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {
             // The GPU wrote imported guest memory directly; page write watching did not see it.
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
@@ -5049,6 +5069,12 @@ void GuestBufferMemory::WriteBack() {
         }
         if (region.gpuCopy) {
             Require(region.buffer != nullptr && end <= region.end, "write-back range exceeds its GPU owner");
+            if (region.host != nullptr) {
+                const auto first = static_cast<std::size_t>(begin - region.begin);
+                const auto length = static_cast<std::size_t>(end - begin);
+                storeChanged(begin, region.host->Bytes().subspan(first, length), std::span<const std::byte>(region.uploaded).subspan(first, length));
+                continue;
+            }
             if (region.copiedBack) {
                 // The GPU copied the written sub-range back into the import; page write watching
                 // did not see it.
