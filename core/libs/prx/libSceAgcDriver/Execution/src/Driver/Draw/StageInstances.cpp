@@ -675,7 +675,7 @@ struct Attempt {
     bool recycled = false;
 };
 
-Attempt attempt(const std::shared_ptr<const Entry>& held, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
+Attempt attempt(const std::shared_ptr<const Entry>& held, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory, const std::vector<Run>*& runsRead) {
     const auto& entry = *held;
     Attempt outcome;
     const auto fail = [&](Miss reason) {
@@ -705,11 +705,15 @@ Attempt attempt(const std::shared_ptr<const Entry>& held, std::span<const std::u
         if (draw[d] != entry.draw[d] && !entry.drawObserved[d]) return fail(MissDraw);
     }
     thread_local std::vector<std::uint32_t> scratch;
-    scratch.assign(entry.words.size(), 0u);
     auto& words = scratch;
-    for (const auto& run : entry.runs) {
-        const auto address = run.origin >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(run.origin)])) + run.at : run.at;
-        if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return fail(MissRead);
+    if (runsRead == nullptr || words.size() != entry.words.size() || !sameRuns(*runsRead, entry.runs)) {
+        runsRead = nullptr;
+        words.assign(entry.words.size(), 0u);
+        for (const auto& run : entry.runs) {
+            const auto address = run.origin >= 0 ? static_cast<std::uint64_t>(aligned(userData[static_cast<std::size_t>(run.origin)])) + run.at : run.at;
+            if (!memory.ReadWords(address, std::span(words).subspan(run.first, run.words))) return fail(MissRead);
+        }
+        runsRead = &entry.runs;
     }
     for (std::size_t w = 0; w < words.size(); ++w) {
         if (words[w] != entry.words[w] && !entry.wordObserved[w]) return fail(MissWord);
@@ -776,8 +780,9 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
         if (found != value.shapes.end()) held = found->second;
     }
     std::optional<Miss> first;
+    const std::vector<Run>* runsRead = nullptr;
     for (std::size_t v = 0; held != nullptr && v < held->variants.size(); ++v) {
-        auto outcome = attempt(held->variants[v], userData, vertex, draw, memory);
+        auto outcome = attempt(held->variants[v], userData, vertex, draw, memory, runsRead);
         if (!outcome.hit) {
             if (!first) first = outcome.miss;
             continue;
