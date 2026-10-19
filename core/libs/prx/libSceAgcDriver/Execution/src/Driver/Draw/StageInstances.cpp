@@ -227,9 +227,9 @@ struct Inputs {
     const Draw* draw;
 };
 
-std::optional<Source> findSource(const Inputs& before, const Inputs& now, std::uint32_t previous, std::uint32_t current) {
+std::optional<Source> findSource(const Inputs& before, const Inputs& now, std::uint32_t previous, std::uint32_t current, bool exactOnly) {
     const auto vertexCount = std::min(vertexWords(*before.vertex), vertexWords(*now.vertex));
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < (exactOnly ? 1 : 2); ++pass) {
         const auto matches = [&](std::uint32_t was, std::uint32_t is) {
             if (pass == 0) return was == previous && is == current;
             return was != is && current - is == previous - was;
@@ -287,7 +287,8 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
         return std::any_of(patches.begin(), patches.end(), [&](const Patch& patch) { return patch.kind == kind && patch.binding == binding && patch.word == word; });
     };
     const auto add = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word, std::uint32_t was, std::uint32_t is) -> bool {
-        const auto source = findSource(before, now, was, is);
+        const bool addressHigh = kind == FieldKind::Binding && current.bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && word % 4u == 1u;
+        const auto source = findSource(before, now, was, is, addressHigh);
         if (!source) return false;
         Patch patch{kind, binding, word, *source, 0, false};
         patch.overflow = overflows(sourceBase(*source, userData, words, vertex, draw), source->delta);
@@ -650,8 +651,10 @@ void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const Sh
         if (kind == Kind::Shape) ++c.mismatchedShape;
         if (!sameRegions) ++c.regionMismatches;
     }
-    static std::atomic<int> shown{0};
-    if ((kind != Kind::Same || !sameRegions) && shown.fetch_add(1) < 40) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx: %s%s (entry stable %u, %zu patches)\n", static_cast<unsigned long long>(codeAddress), kind == Kind::Same ? "result equal" : detail, sameRegions ? "" : "; regions differ", held != nullptr ? held->stable : 0u, held != nullptr ? held->patches.size() : 0u);
+    static std::atomic<int> shownPatched{0};
+    static std::atomic<int> shownOther{0};
+    auto& shown = kind == Kind::Patched ? shownPatched : shownOther;
+    if ((kind != Kind::Same || !sameRegions) && shown.fetch_add(1) < 25) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx: %s%s (entry stable %u, %zu patches)\n", static_cast<unsigned long long>(codeAddress), kind == Kind::Same ? "result equal" : detail, sameRegions ? "" : "; regions differ", held != nullptr ? held->stable : 0u, held != nullptr ? held->patches.size() : 0u);
 }
 
 void StageInstanceTimed(double fastMicroseconds, double fullMicroseconds) {
