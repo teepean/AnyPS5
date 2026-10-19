@@ -5409,7 +5409,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
-            stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            stamp = {GuestMemory::TrackerGenerationUnlocked(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
         VkDeviceSize offset = 0;
@@ -5554,7 +5554,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     result->owner = ownedSets;
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    const Buffer* kept = nullptr;
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.buffer.get() == kept) continue;
+        kept = snapshot.buffer.get();
+        recorder.KeepBytes(kept, snapshot.buffer->Bytes().size());
+    }
     return result;
 }
 

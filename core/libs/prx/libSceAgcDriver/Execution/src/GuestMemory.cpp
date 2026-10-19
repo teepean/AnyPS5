@@ -1732,6 +1732,10 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
     return true;
 }
 
+std::uint64_t TrackerGenerationUnlocked() {
+    return Tracker().generation.load(std::memory_order_acquire);
+}
+
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
