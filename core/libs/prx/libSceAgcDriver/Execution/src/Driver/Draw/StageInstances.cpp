@@ -128,23 +128,40 @@ State& state() {
     return *value;
 }
 
-std::shared_ptr<ShaderRecompiler::RecompileResult> recycledCopy(const ShaderRecompiler::RecompileResult& source, bool& recycled) {
+struct RecycledSlot {
+    std::shared_ptr<ShaderRecompiler::RecompileResult> result;
+    std::shared_ptr<const void> owner;
+};
+
+std::shared_ptr<ShaderRecompiler::RecompileResult> recycledCopy(const std::shared_ptr<const void>& owner, const ShaderRecompiler::RecompileResult& source, bool& recycled, bool& kept) {
     constexpr std::size_t Slots = 64;
-    thread_local std::array<std::shared_ptr<ShaderRecompiler::RecompileResult>, Slots> pool;
+    thread_local std::array<RecycledSlot, Slots> pool;
     thread_local std::size_t next = 0;
     recycled = false;
+    kept = false;
+    if (owner != nullptr) {
+        for (auto& slot : pool) {
+            if (slot.owner != owner || slot.result == nullptr || slot.result.use_count() != 1) continue;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            recycled = true;
+            kept = true;
+            return slot.result;
+        }
+    }
     for (std::size_t tried = 0; tried < Slots; ++tried) {
         auto& slot = pool[next];
         next = (next + 1) % Slots;
-        if (slot == nullptr) {
-            slot = std::make_shared<ShaderRecompiler::RecompileResult>(source);
-            return slot;
+        if (slot.result == nullptr) {
+            slot.result = std::make_shared<ShaderRecompiler::RecompileResult>(source);
+            slot.owner = owner;
+            return slot.result;
         }
-        if (slot.use_count() != 1) continue;
+        if (slot.result.use_count() != 1) continue;
         std::atomic_thread_fence(std::memory_order_acquire);
-        *slot = source;
+        *slot.result = source;
+        slot.owner = owner;
         recycled = true;
-        return slot;
+        return slot.result;
     }
     return std::make_shared<ShaderRecompiler::RecompileResult>(source);
 }
@@ -651,7 +668,8 @@ struct Attempt {
     bool recycled = false;
 };
 
-Attempt attempt(const Entry& entry, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
+Attempt attempt(const std::shared_ptr<const Entry>& held, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
+    const auto& entry = *held;
     Attempt outcome;
     const auto fail = [&](Miss reason) {
         outcome.miss = reason;
@@ -708,7 +726,8 @@ Attempt attempt(const Entry& entry, std::span<const std::uint32_t> userData, con
     StageInstanceHit hit{entry.result, entry.use, !StageInstancesVerify() && checkEvery() != 0 && ++served % checkEvery() == 0};
     bool recycled = false;
     if (changed) {
-        auto result = recycledCopy(*entry.result, recycled);
+        bool kept = false;
+        auto result = recycledCopy(held, *entry.result, recycled, kept);
         for (const auto& patch : entry.patches) {
             if (patch.kind == FieldKind::Address) {
                 const auto address = addressValue(patch.source, userData, words, vertex, draw);
@@ -721,7 +740,9 @@ Attempt attempt(const Entry& entry, std::span<const std::uint32_t> userData, con
             if (patch.kind == FieldKind::Binding) result->bindings[patch.binding].guestDescriptor[patch.word] = patched;
             else std::memcpy(result->pushConstants.data() + patch.word * sizeof(std::uint32_t), &patched, sizeof(patched));
         }
-        for (auto& attribute : result->vertexAttributes) {
+        for (std::size_t index = 0; index < result->vertexAttributes.size(); ++index) {
+            auto& attribute = result->vertexAttributes[index];
+            if (kept) attribute = entry.result->vertexAttributes[index];
             if (!vertex.has_value() || attribute.location >= vertex->resources.size()) continue;
             attribute.resource = vertex->resources[attribute.location];
             if (vertex->fetchEmbedded) attribute.fetchIndex = vertex->resourcesDst[attribute.location].fetchIndex;
@@ -749,7 +770,7 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     }
     std::optional<Miss> first;
     for (std::size_t v = 0; held != nullptr && v < held->variants.size(); ++v) {
-        auto outcome = attempt(*held->variants[v], userData, vertex, draw, memory);
+        auto outcome = attempt(held->variants[v], userData, vertex, draw, memory);
         if (!outcome.hit) {
             if (!first) first = outcome.miss;
             continue;
