@@ -72,6 +72,7 @@ struct Entry {
     bool ready = false;
     std::uint32_t stable = 0;
     std::uint32_t failures = 0;
+    bool everLearned = false;
     mutable std::uint32_t skip = 0;
 };
 
@@ -700,7 +701,8 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
         entry->learned = !failure.has_value();
         entry->stable = failure ? 0u : previous->stable + 1u;
         entry->failures = failure ? previous->failures + 1u : 0u;
-        entry->skip = failure && entry->failures >= 2u ? std::min(64u, 1u << std::min(entry->failures, 6u)) : 0u;
+        entry->everLearned = previous->everLearned || !failure.has_value();
+        entry->skip = failure && !entry->everLearned && entry->failures >= 3u ? std::min(32u, 1u << std::min(entry->failures - 2u, 5u)) : 0u;
         if (failure) entry->patches.clear();
     }
     const auto& snapshot = capture.snapshot;
