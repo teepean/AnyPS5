@@ -165,8 +165,15 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
+        Item done;
+        {
+            std::lock_guard lock(mutex);
+            done = std::move(items.front());
+            items.pop_front();
+            if (idleWaiters != 0) idle.notify_all();
+        }
+        done = Item{};
         std::lock_guard lock(mutex);
-        items.pop_front();
         ++commits;
         commitNs += spent;
         if (failed) ++commitErrors;
@@ -198,7 +205,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    idle.wait(lock, [&] { return items.empty() && outstanding.load(std::memory_order_acquire) == 0; });
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
