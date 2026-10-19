@@ -8,6 +8,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -707,6 +708,7 @@ public:
     static std::uint64_t Finds();
     static std::uint64_t Touches();
     void Clear();
+    std::uint64_t Modifications() const { return modifications.load(std::memory_order_acquire); }
     std::size_t Size() const;
     std::size_t Capacity() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
@@ -730,6 +732,7 @@ private:
         }
     };
     mutable std::mutex mutex;
+    std::atomic<std::uint64_t> modifications{0};
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     std::size_t capacity = 0;

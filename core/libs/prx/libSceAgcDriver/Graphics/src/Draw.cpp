@@ -367,6 +367,10 @@ struct DrawOutcome {
     // A build that acquired the allocation registry lease (BDA), whose cost sits outside the
     // build's own sub-phases.
     bool addressBased = false;
+    bool repeatHinted = false;
+    bool repeatedTargets = false;
+    bool repeatedTemplate = false;
+    bool repeatedPipeline = false;
     // Resident target lookups, and those that took a millisecond or more. Whether a slow one
     // re-uploaded the image or just walked its pages under contention is not visible from here
     // (StorageTexture::Version advances on every MarkDirty as well as on an upload, and Generation
@@ -432,6 +436,7 @@ struct DrawProfile {
     // Render passes recorded draws began, and draws that continued the previous draw's pass.
     std::uint64_t passesBegun = 0;
     std::uint64_t passesContinued = 0;
+    std::array<std::uint64_t, 4> repeatPath{};
     std::array<DrawPassCounts, 2> passTotals{};
     std::array<std::uint64_t, SyncCount> reasons{};
     // The CPU inside Graphics::Draw, split by outcome: a synchronous draw costs ten times a recorded
@@ -503,6 +508,10 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.completion) ++profile.completion;
     if (outcome.passBegun) ++profile.passesBegun;
     if (outcome.passContinued) ++profile.passesContinued;
+    if (outcome.repeatHinted) ++profile.repeatPath[0];
+    if (outcome.repeatedTargets) ++profile.repeatPath[1];
+    if (outcome.repeatedTemplate) ++profile.repeatPath[2];
+    if (outcome.repeatedPipeline) ++profile.repeatPath[3];
     if (outcome.recorded) {
         auto& totals = profile.passTotals[outcome.addressDraw ? 1 : 0];
         ++totals.draws;
@@ -530,7 +539,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[3072];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -543,6 +552,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; repeat path: hinted %llu, targets %llu, templates %llu, pipelines %llu", static_cast<unsigned long long>(profile.repeatPath[0]), static_cast<unsigned long long>(profile.repeatPath[1]), static_cast<unsigned long long>(profile.repeatPath[2]), static_cast<unsigned long long>(profile.repeatPath[3]));
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.0f (%llu)", DrawKindNames[kind], average(profile.kindUs[kind], profile.kindCounts[kind]), static_cast<unsigned long long>(profile.kindCounts[kind]));
@@ -581,6 +591,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.addressBuilds = 0;
     profile.draws = profile.recorded = profile.waited = profile.completion = 0;
     profile.passesBegun = profile.passesContinued = 0;
+    profile.repeatPath.fill(0);
     profile.reasons.fill(0);
     profile.recordedUs = profile.waitedUs = profile.synchronousUs = 0;
     profile.targetLookups = profile.slowLookups = 0;
@@ -1400,6 +1411,45 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+struct RepeatedDraw {
+    bool valid = false;
+    std::uint64_t sequence = 0;
+    VkDevice device = VK_NULL_HANDLE;
+    const Recorder* recorder = nullptr;
+    ResourceCache::Key key;
+    std::uint64_t cacheModifications = 0;
+    std::weak_ptr<ShaderResources> resources;
+    std::weak_ptr<Pipeline> pipeline;
+    std::weak_ptr<Framebuffer> framebuffer;
+    std::vector<VkImageView> targetViews;
+    std::vector<std::weak_ptr<StorageTexture>> owners;
+    VertexInputLayout vertexLayout;
+    std::uint32_t fragmentOutputs = 0;
+};
+
+RepeatedDraw& lastDraw() {
+    thread_local RepeatedDraw draw;
+    return draw;
+}
+
+struct RepeatHint {
+    std::uint64_t sequence = 0;
+    std::uint64_t repeatOf = 0;
+};
+
+thread_local RepeatHint drawRepeatHint;
+
+bool sameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
+    if (a.bindings.size() != b.bindings.size() || a.attributes.size() != b.attributes.size()) return false;
+    for (std::size_t i = 0; i < a.bindings.size(); ++i) {
+        if (a.bindings[i].binding != b.bindings[i].binding || a.bindings[i].stride != b.bindings[i].stride || a.bindings[i].inputRate != b.bindings[i].inputRate) return false;
+    }
+    for (std::size_t i = 0; i < a.attributes.size(); ++i) {
+        if (a.attributes[i].location != b.attributes[i].location || a.attributes[i].binding != b.attributes[i].binding || a.attributes[i].format != b.attributes[i].format || a.attributes[i].offset != b.attributes[i].offset) return false;
+    }
+    return true;
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1410,7 +1460,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const RepeatedDraw* repeat = nullptr) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1427,7 +1477,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        std::shared_ptr<ShaderResources> repeated;
+        if (repeat != nullptr && repeat->key == resolved.contentKey && SharedResourceCache().Modifications() == repeat->cacheModifications) repeated = repeat->resources.lock();
+        outcome.repeatedTemplate = repeated != nullptr;
+        if (auto cached = repeated != nullptr ? std::move(repeated) : SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -2119,6 +2172,10 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
+void SetDrawRepeatHint(std::uint64_t sequence, std::uint64_t repeatOf) {
+    drawRepeatHint = {sequence, repeatOf};
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
@@ -2158,6 +2215,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
+    auto& last = lastDraw();
+    const bool lastValid = std::exchange(last.valid, false);
+    const auto hint = std::exchange(drawRepeatHint, RepeatHint{});
+    outcome.repeatHinted = hint.repeatOf != 0;
+    bool repeat = outcome.repeatHinted && lastValid && hint.repeatOf == last.sequence && last.device == context.device && last.recorder == Recorder::Active() && stencilReferences.empty() && !state.quadList && !draw.indirect && last.owners.size() == state.colors.size() && DumpTargetLimit() == 0;
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
@@ -2193,11 +2255,37 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static std::map<std::uint64_t, int> dumped;
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
+    std::vector<std::shared_ptr<StorageTexture>> repeatTargets;
+    if (repeat) {
+        repeatTargets.reserve(state.colors.size());
+        for (std::size_t index = 0; index < state.colors.size() && repeat; ++index) {
+            const auto& color = state.colors[index];
+            auto stored = last.owners[index].lock();
+            repeat = stored != nullptr && color.samples <= 1 && color.tileMode != ColorTileMode::Linear && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED && StorageImageCached(context, stored.get()) && StorageImageServesKeys(*stored, color.dccAddress);
+            repeatTargets.push_back(std::move(stored));
+        }
+    }
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+        if (repeat) {
+            const ColorTargetLayout repeatLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+            RetireDepthSurfaces(context.device, color.address, repeatLayout.Bytes());
+            timer.phase(PhaseSetup);
+            const auto& stored = repeatTargets[index];
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                stored->Refresh();
+                return stored;
+            });
+            if (binding.resident != nullptr) {
+                timer.phase(PhaseReadTarget);
+                targetViews.push_back(binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+                continue;
+            }
+            repeat = false;
+        }
         if (color.samples > 1) {
             binding.multisampled = true;
             timer.phase(PhaseSetup);
@@ -2283,7 +2371,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    outcome.repeatedTargets = repeat && !state.colors.empty();
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, repeat ? &last : nullptr);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -2456,7 +2545,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    std::shared_ptr<Pipeline> pipeline;
+    std::shared_ptr<Framebuffer> framebuffer;
+    if (repeat && lean && stencilReplay.empty() && targetViews == last.targetViews && inputs.fragmentOutputs == last.fragmentOutputs && resources == last.resources.lock() && sameVertexLayout(inputs.VertexLayout(), last.vertexLayout)) {
+        pipeline = last.pipeline.lock();
+        framebuffer = last.framebuffer.lock();
+        if (pipeline == nullptr || framebuffer == nullptr) {
+            pipeline.reset();
+            framebuffer.reset();
+        }
+        outcome.repeatedPipeline = pipeline != nullptr;
+    }
+    if (pipeline == nullptr) pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -2467,7 +2567,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         owners.push_back(binding.resident);
         framebufferOwners.push_back(binding.multisampled ? binding.multisampleOwner : binding.resident);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2493,6 +2593,21 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.waited = outcome.waited;
         record.stencilReplay = stencilReplay;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+        if (hint.sequence != 0 && !outcome.waited && args == nullptr && stencilReplay.empty() && !multisampled && cacheable && resources->Reusable() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.resident == nullptr; })) {
+            last.valid = true;
+            last.sequence = hint.sequence;
+            last.device = context.device;
+            last.recorder = recorder;
+            last.key.assign(contentKey.begin(), contentKey.end());
+            last.cacheModifications = SharedResourceCache().Modifications();
+            last.resources = resources;
+            last.pipeline = pipeline;
+            last.framebuffer = framebuffer;
+            last.targetViews.assign(targetViews.begin(), targetViews.end());
+            last.owners.assign(owners.begin(), owners.end());
+            last.vertexLayout = inputs.VertexLayout();
+            last.fragmentOutputs = inputs.fragmentOutputs;
+        }
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
@@ -2781,6 +2896,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+    lastDraw().valid = false;
+    drawRepeatHint = RepeatHint{};
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
