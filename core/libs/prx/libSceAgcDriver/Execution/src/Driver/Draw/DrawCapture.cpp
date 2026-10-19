@@ -30,8 +30,6 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
-    timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
@@ -64,6 +62,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }
     const auto fullStart = instanceKey != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    timing.Mark("prepared_invocation");
     const auto named = [&](const std::exception& error) {
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         std::string dump;
