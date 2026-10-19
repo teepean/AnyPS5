@@ -85,9 +85,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
+        ++roomWaiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        --roomWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -170,7 +170,7 @@ void DrawPipeline::run() {
             std::lock_guard lock(mutex);
             done = std::move(items.front());
             items.pop_front();
-            if (idleWaiters != 0) idle.notify_all();
+            if (roomWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
         }
         done = Item{};
         std::lock_guard lock(mutex);
@@ -178,8 +178,7 @@ void DrawPipeline::run() {
         commitNs += spent;
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0) idle.notify_all();
+        if (outstanding.fetch_sub(1, std::memory_order_release) == 1 && drainWaiters != 0) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -204,9 +203,9 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
-    ++idleWaiters;
+    ++drainWaiters;
     idle.wait(lock, [&] { return items.empty() && outstanding.load(std::memory_order_acquire) == 0; });
-    --idleWaiters;
+    --drainWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
