@@ -75,7 +75,9 @@ void DrawPipeline::rethrowFailure() {
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::vector<Item> dead;
     std::unique_lock lock(mutex);
+    if (!finished.empty() && !GuestMemory::GpuMutex().HeldByThisThread()) dead.swap(finished);
     rethrowFailure();
     if (closing) {
         lock.unlock();
@@ -208,15 +210,10 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        Item done;
-        {
-            std::lock_guard lock(mutex);
-            done = std::move(items.front());
-            items.pop_front();
-            if (roomWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
-        }
-        done = Item{};
         std::lock_guard lock(mutex);
+        finished.push_back(std::move(items.front()));
+        items.pop_front();
+        if (roomWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
         ++commits;
         commitNs += spent;
         if (failed) ++commitErrors;
@@ -237,6 +234,9 @@ void DrawPipeline::Stop() {
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
     else committer.join();
+    std::vector<Item> dead;
+    std::lock_guard lock(mutex);
+    dead.swap(finished);
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
@@ -245,10 +245,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
+    std::vector<Item> dead;
     std::unique_lock lock(mutex);
     ++drainWaiters;
     idle.wait(lock, [&] { return items.empty() && outstanding.load(std::memory_order_acquire) == 0; });
     --drainWaiters;
+    dead.swap(finished);
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
