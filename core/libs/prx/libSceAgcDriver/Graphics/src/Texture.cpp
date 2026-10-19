@@ -3638,7 +3638,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
-bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool ordered) {
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
@@ -3692,7 +3692,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
+    if (auto* recorder = Recorder::Active(); !ordered && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
@@ -3936,12 +3936,13 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
             if (auto alive = texture->weak_from_this().lock()) small.push_back(std::move(alive));
         }
     }
+    static const bool synced = std::getenv("APS5_SYNC_FLIP_STORE") != nullptr;
     std::size_t stored = 0;
     for (const auto& texture : small) {
         const auto address = texture->descriptor.baseAddress;
         const auto bytes = static_cast<std::size_t>(texture->guestBytes);
         if (!HostImportCovers(texture->context, address, bytes)) continue;
-        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+        if (FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, !synced)) ++stored;
     }
     return stored;
 }
