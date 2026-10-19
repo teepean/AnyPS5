@@ -5491,16 +5491,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         Require(nextWrite == descriptorWrites.end(), "draw snapshot writes disagree with their descriptor bindings");
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
-    buffers = descriptorBuffers;
-    for (std::size_t index = 0; index < selected.size(); ++index) {
-        const auto& snapshot = result->snapshots[index];
-        for (const auto offset : allocationOffsets[selected[index]]) {
-            buffers[offset] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
-            result->snapshotSlots.push_back(offset);
-        }
-    }
     std::optional<OwnedSets::Held> reused;
     if (ownedSets == nullptr) {
         ownedSets = std::make_shared<OwnedSets>();
@@ -5511,6 +5501,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             ownedSets->idle.pop_back();
         }
     }
+    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
+    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    if (reused) buffers.clear();
+    else buffers = descriptorBuffers;
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result->snapshots[index];
+        for (const auto offset : allocationOffsets[selected[index]]) {
+            const VkDescriptorBufferInfo info{snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+            if (reused) buffers.push_back(info);
+            else buffers[offset] = info;
+            result->snapshotSlots.push_back(offset);
+        }
+    }
     thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
     auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
     if (reused) {
@@ -5519,7 +5522,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (result->allocation.set != VK_NULL_HANDLE) result->layout = _layout;
         if (result->fragmentAllocation.set != VK_NULL_HANDLE) result->fragmentLayout = fragment.layout;
         writes.clear();
-        const auto rewrite = [&](std::uint32_t offset) {
+        const auto rewrite = [&](std::uint32_t offset, const VkDescriptorBufferInfo* info) {
             const auto& slot = bufferSlots[offset];
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstSet = slot.set == 0 ? result->allocation.set : result->fragmentAllocation.set;
@@ -5527,12 +5530,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             write.dstArrayElement = slot.element;
             write.descriptorCount = 1;
             write.descriptorType = slot.type;
-            write.pBufferInfo = buffers.data() + offset;
+            write.pBufferInfo = info;
             writes.push_back(write);
         };
-        for (const auto offset : result->snapshotSlots) rewrite(offset);
+        for (std::size_t k = 0; k < result->snapshotSlots.size(); ++k) rewrite(result->snapshotSlots[k], buffers.data() + k);
         for (const auto offset : reused->snapshotSlots) {
-            if (std::find(result->snapshotSlots.begin(), result->snapshotSlots.end(), offset) == result->snapshotSlots.end()) rewrite(offset);
+            if (std::find(result->snapshotSlots.begin(), result->snapshotSlots.end(), offset) == result->snapshotSlots.end()) rewrite(offset, descriptorBuffers.data() + offset);
         }
     } else {
         std::array<bool, 2> described{};
