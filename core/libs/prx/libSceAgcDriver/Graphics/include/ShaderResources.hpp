@@ -153,6 +153,7 @@ struct PresyncSurface {
     std::uint64_t address;
     std::uint64_t bytes;
     bool dccKeys;
+    bool writerOnly;
 };
 
 class ShaderResources {
