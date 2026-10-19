@@ -99,6 +99,7 @@ struct Counters {
     std::uint64_t checks = 0;
     std::uint64_t retired = 0;
     std::uint64_t skippedLearns = 0;
+    std::uint64_t recycled = 0;
     std::uint64_t fastTimed = 0;
     double fastUs = 0.0;
     std::uint64_t fullTimed = 0;
@@ -115,6 +116,27 @@ struct State {
 State& state() {
     static State* value = new State();
     return *value;
+}
+
+std::shared_ptr<ShaderRecompiler::RecompileResult> recycledCopy(const ShaderRecompiler::RecompileResult& source, bool& recycled) {
+    constexpr std::size_t Slots = 64;
+    thread_local std::array<std::shared_ptr<ShaderRecompiler::RecompileResult>, Slots> pool;
+    thread_local std::size_t next = 0;
+    recycled = false;
+    for (std::size_t tried = 0; tried < Slots; ++tried) {
+        auto& slot = pool[next];
+        next = (next + 1) % Slots;
+        if (slot == nullptr) {
+            slot = std::make_shared<ShaderRecompiler::RecompileResult>(source);
+            return slot;
+        }
+        if (slot.use_count() != 1) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        *slot = source;
+        recycled = true;
+        return slot;
+    }
+    return std::make_shared<ShaderRecompiler::RecompileResult>(source);
 }
 
 thread_local std::uint64_t currentShape = 0;
@@ -479,7 +501,7 @@ void report(State& value) {
     auto& c = value.counters;
     std::string line;
     char piece[400];
-    std::snprintf(piece, sizeof(piece), "[stage-instances] (10 s): %llu lookups, %llu hits (%.1f%%; %llu shared the cached result, %.2f words patched per hit); misses:", static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.hits), c.lookups != 0 ? 100.0 * static_cast<double>(c.hits) / static_cast<double>(c.lookups) : 0.0, static_cast<unsigned long long>(c.shared), c.hits != 0 ? static_cast<double>(c.patchedWords) / static_cast<double>(c.hits) : 0.0);
+    std::snprintf(piece, sizeof(piece), "[stage-instances] (10 s): %llu lookups, %llu hits (%.1f%%; %llu shared the cached result, %llu patched in a recycled copy, %.2f words patched per hit); misses:", static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.hits), c.lookups != 0 ? 100.0 * static_cast<double>(c.hits) / static_cast<double>(c.lookups) : 0.0, static_cast<unsigned long long>(c.shared), static_cast<unsigned long long>(c.recycled), c.hits != 0 ? static_cast<double>(c.patchedWords) / static_cast<double>(c.hits) : 0.0);
     line += piece;
     for (std::size_t m = 0; m < MissCount; ++m) {
         std::snprintf(piece, sizeof(piece), " %s %llu", MissNames[m], static_cast<unsigned long long>(c.misses[m]));
@@ -643,8 +665,9 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     }
     thread_local std::uint64_t served = 0;
     StageInstanceHit hit{entry.result, entry.use, !StageInstancesVerify() && checkEvery() != 0 && ++served % checkEvery() == 0};
+    bool recycled = false;
     if (changed) {
-        auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*entry.result);
+        auto result = recycledCopy(*entry.result, recycled);
         for (const auto& patch : entry.patches) {
             if (patch.kind == FieldKind::Address) {
                 const auto address = addressValue(patch.source, userData, words, vertex, draw);
@@ -669,6 +692,7 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     auto& c = value.counters;
     if (changed) c.patchedWords += entry.patches.size();
     else ++c.shared;
+    if (recycled) ++c.recycled;
     if (hit.check) ++c.checks;
     ++c.hits;
     ++c.fastTimed;
