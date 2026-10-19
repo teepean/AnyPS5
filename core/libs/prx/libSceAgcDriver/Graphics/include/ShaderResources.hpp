@@ -606,6 +606,7 @@ private:
         std::vector<std::uint32_t> words;
         std::size_t size;
         std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;

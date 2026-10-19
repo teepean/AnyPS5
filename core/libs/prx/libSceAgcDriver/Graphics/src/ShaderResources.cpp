@@ -5402,20 +5402,24 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
+                offset = held->offset;
             } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+                auto slice = recorder.DrawUpload(override->size);
+                std::memcpy(slice.bytes, override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
-                    if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                    if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer};
+                buffer = std::move(slice.buffer);
+                offset = slice.offset;
+                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer, offset};
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
             selected.push_back(index);
-            keep({0, std::move(buffer), 0, override->size});
+            keep({0, std::move(buffer), offset, override->size});
             continue;
         }
         std::uint64_t address = item.address;
