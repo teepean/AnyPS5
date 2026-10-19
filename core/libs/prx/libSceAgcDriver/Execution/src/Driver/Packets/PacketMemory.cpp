@@ -348,7 +348,8 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     DrawPipeline::Queue0().Enqueue([this, queue, copy = *copy] {
         GuestMemory::SetCurrentPacket(0x50, queue);
         constexpr std::size_t gpuStoreLimit = 65536;
-        if (copy.bytes > gpuStoreLimit) {
+        static const bool cpuSourced = std::getenv("APS5_DMA_CPU_SOURCE") != nullptr;
+        if (copy.bytes > gpuStoreLimit || (!cpuSourced && Graphics::Recorder::SnapshotWriteOverlaps(copy.source, copy.bytes))) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             if (const auto localDevice = device.Load()) {
