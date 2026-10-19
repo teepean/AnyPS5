@@ -292,19 +292,26 @@ struct VertexCopyPlan {
     std::vector<std::uint32_t> alignments;
 };
 
-inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
-    VertexCopyPlan plan;
+inline void PlanVertexCopies(std::span<const VertexFetch> fetches, VertexCopyPlan& plan, std::vector<std::size_t>& order) {
+    plan.copies.clear();
+    plan.alignments.clear();
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
+    order.resize(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    const auto before = [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
         const auto& y = fetches[b];
         if (x.stride != y.stride) return x.stride < y.stride;
         if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
         return x.begin < y.begin;
-    });
+    };
+    for (std::size_t i = 1; i < order.size(); ++i) {
+        const auto value = order[i];
+        auto j = i;
+        for (; j > 0 && before(value, order[j - 1]); --j) order[j] = order[j - 1];
+        order[j] = value;
+    }
     std::size_t lead = fetches.size();
     for (const auto i : order) {
         const auto& fetch = fetches[i];
@@ -321,6 +328,12 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
         plan.copyOf[i] = plan.copies.size() - 1;
         plan.offsets[i] = fetch.begin - copy.first;
     }
+}
+
+inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    PlanVertexCopies(fetches, plan, order);
     return plan;
 }
 
@@ -407,12 +420,17 @@ inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> in
     return starts;
 }
 
-inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
+inline void SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid, std::vector<std::size_t>& solo) {
     Require(fetchValid.size() == fetches.size(), "fetch validity does not match the fetch count");
-    std::vector<std::size_t> solo;
+    solo.clear();
     for (std::size_t i = 0; i < fetches.size(); ++i) {
         if (fetchValid[i] < fetches[i].end - fetches[i].begin) solo.push_back(i);
     }
+}
+
+inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
+    std::vector<std::size_t> solo;
+    SoloZeroPaddedFetchIndices(fetches, fetchValid, solo);
     return solo;
 }
 

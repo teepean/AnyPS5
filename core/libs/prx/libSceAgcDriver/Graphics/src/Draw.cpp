@@ -1303,12 +1303,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
-    fetches.reserve(attributes.size());
-    fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    thread_local std::vector<VertexFetch>* fetchesSlot = nullptr;
+    auto& fetches = ShaderRecompiler::ThreadOwned(fetchesSlot);
+    fetches.clear();
+    thread_local std::vector<std::size_t>* fetchValidSlot = nullptr;
+    auto& fetchValid = ShaderRecompiler::ThreadOwned(fetchValidSlot);
+    fetchValid.clear();
+    thread_local std::vector<std::size_t>* fetchOfSlot = nullptr;
+    auto& fetchOf = ShaderRecompiler::ThreadOwned(fetchOfSlot);
+    fetchOf.assign(attributes.size(), 0);
+    thread_local std::vector<std::shared_ptr<Buffer>>* zeroedSlot = nullptr;
+    auto& zeroed = ShaderRecompiler::ThreadOwned(zeroedSlot);
+    zeroed.assign(attributes.size(), nullptr);
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
         if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
@@ -1327,22 +1333,34 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    thread_local std::vector<std::size_t>* soloSlot = nullptr;
+    auto& soloFetches = ShaderRecompiler::ThreadOwned(soloSlot);
+    SoloZeroPaddedFetchIndices(fetches, fetchValid, soloFetches);
+    thread_local std::vector<bool>* isSoloSlot = nullptr;
+    auto& isSolo = ShaderRecompiler::ThreadOwned(isSoloSlot);
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
-    plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    thread_local std::vector<VertexFetch>* plannedSlot = nullptr;
+    auto& plannedFetches = ShaderRecompiler::ThreadOwned(plannedSlot);
+    plannedFetches.clear();
+    thread_local std::vector<std::size_t>* plannedOfSlot = nullptr;
+    auto& plannedOf = ShaderRecompiler::ThreadOwned(plannedOfSlot);
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
-    const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
-    rangeHandles.reserve(plan.copies.size());
-    rangeOffsets.reserve(plan.copies.size());
+    thread_local VertexCopyPlan* planSlot = nullptr;
+    auto& plan = ShaderRecompiler::ThreadOwned(planSlot);
+    thread_local std::vector<std::size_t>* orderSlot = nullptr;
+    PlanVertexCopies(plannedFetches, plan, ShaderRecompiler::ThreadOwned(orderSlot));
+    thread_local std::vector<VkBuffer>* rangeHandlesSlot = nullptr;
+    auto& rangeHandles = ShaderRecompiler::ThreadOwned(rangeHandlesSlot);
+    rangeHandles.clear();
+    thread_local std::vector<VkDeviceSize>* rangeOffsetsSlot = nullptr;
+    auto& rangeOffsets = ShaderRecompiler::ThreadOwned(rangeOffsetsSlot);
+    rangeOffsets.clear();
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1360,7 +1378,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    thread_local std::vector<VkBuffer>* soloHandlesSlot = nullptr;
+    auto& soloHandles = ShaderRecompiler::ThreadOwned(soloHandlesSlot);
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
