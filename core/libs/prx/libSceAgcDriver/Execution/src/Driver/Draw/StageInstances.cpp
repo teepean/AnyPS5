@@ -31,9 +31,12 @@ struct Source {
     SourceKind kind;
     std::uint32_t index;
     std::uint32_t delta;
+    std::uint64_t wide = 0;
 };
 
-enum class FieldKind : std::uint8_t { Binding, Push };
+enum class FieldKind : std::uint8_t { Binding, Push, Address };
+
+constexpr std::uint64_t AddressMask = (std::uint64_t{1} << 48u) - 1u;
 
 struct Patch {
     FieldKind kind;
@@ -220,6 +223,39 @@ std::uint32_t fieldValue(const ShaderRecompiler::RecompileResult& result, const 
     return patch.kind == FieldKind::Binding ? result.bindings[patch.binding].guestDescriptor[patch.word] : pushWord(result, patch.word);
 }
 
+std::uint64_t addressOf(const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element) {
+    const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+    return (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u) | words[0];
+}
+
+bool bufferQuads(const ShaderRecompiler::DescriptorBinding& binding) {
+    return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u;
+}
+
+bool pairExists(const Source& source, std::size_t userWords, std::size_t readWords, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+    switch (source.kind) {
+        case SourceKind::User: return static_cast<std::size_t>(source.index) + 1u < userWords;
+        case SourceKind::Word: return static_cast<std::size_t>(source.index) + 1u < readWords;
+        case SourceKind::Vertex: return source.index % 4u == 0u && source.index < vertexWords(vertex);
+        case SourceKind::Draw: return source.index == 0u;
+    }
+    return false;
+}
+
+std::uint64_t pairValue(const Source& source, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> words, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw) {
+    switch (source.kind) {
+        case SourceKind::User: return (static_cast<std::uint64_t>(userData[source.index + 1u]) << 32u) | userData[source.index];
+        case SourceKind::Word: return (static_cast<std::uint64_t>(words[source.index + 1u]) << 32u) | words[source.index];
+        case SourceKind::Vertex: return (static_cast<std::uint64_t>(vertexWord(*vertex, source.index + 1u) & 0xffffu) << 32u) | vertexWord(*vertex, source.index);
+        case SourceKind::Draw: return (static_cast<std::uint64_t>(draw[1]) << 32u) | draw[0];
+    }
+    return 0;
+}
+
+std::uint64_t addressValue(const Source& source, std::span<const std::uint32_t> userData, std::span<const std::uint32_t> words, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw) {
+    return (pairValue(source, userData, words, vertex, draw) + source.wide) & AddressMask;
+}
+
 struct Inputs {
     std::span<const std::uint32_t> userData;
     std::span<const std::uint32_t> words;
@@ -252,6 +288,27 @@ std::optional<Source> findSource(const Inputs& before, const Inputs& now, std::u
     return std::nullopt;
 }
 
+std::optional<Source> findAddressSource(const Inputs& before, const Inputs& now, std::uint64_t previous, std::uint64_t current) {
+    const auto vertexCount = std::min(vertexWords(*before.vertex), vertexWords(*now.vertex));
+    std::vector<Source> candidates;
+    for (std::uint32_t u = 0; u + 1u < now.userData.size() && u + 1u < before.userData.size(); ++u) candidates.push_back({SourceKind::User, u, 0});
+    for (std::uint32_t v = 0; v < vertexCount; v += 4u) candidates.push_back({SourceKind::Vertex, v, 0});
+    candidates.push_back({SourceKind::Draw, 0, 0});
+    for (std::uint32_t w = 0; w + 1u < now.words.size() && w + 1u < before.words.size(); ++w) candidates.push_back({SourceKind::Word, w, 0});
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto candidate : candidates) {
+            const auto was = pairValue(candidate, before.userData, before.words, *before.vertex, *before.draw) & AddressMask;
+            const auto is = pairValue(candidate, now.userData, now.words, *now.vertex, *now.draw) & AddressMask;
+            if (pass == 0 && was == previous && is == current) return candidate;
+            if (pass == 1 && was != is && ((current - is) & AddressMask) == ((previous - was) & AddressMask)) {
+                candidate.wide = (current - is) & AddressMask;
+                return candidate;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const Draw& draw, const ShaderRecompiler::RecompileResult& current) {
     const auto& previous = *entry.result;
     if (!sameRuns(entry.runs, runs) || entry.userData.size() != userData.size()) return FailStructure;
@@ -275,6 +332,15 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
     const Inputs now{userData, words, &vertex, &draw};
     std::vector<Patch> patches;
     for (const auto& patch : entry.patches) {
+        if (patch.kind == FieldKind::Address) {
+            if (patch.binding >= current.bindings.size() || patch.word >= current.bindings[patch.binding].count || !bufferQuads(current.bindings[patch.binding]) || !pairExists(patch.source, userData.size(), words.size(), vertex)) continue;
+            if (addressOf(previous.bindings[patch.binding], patch.word) != addressValue(patch.source, entry.userData, entry.words, entry.vertex, entry.draw)) continue;
+            if (addressOf(current.bindings[patch.binding], patch.word) != addressValue(patch.source, userData, words, vertex, draw)) continue;
+            auto confirmed = patch;
+            ++confirmed.confirmations;
+            patches.push_back(confirmed);
+            continue;
+        }
         if (!fieldExists(previous, patch) || !fieldExists(current, patch) || !sourceExists(patch.source, userData.size(), words.size(), vertex)) continue;
         if (fieldValue(previous, patch) != sourceValue(patch.source, entry.userData, entry.words, entry.vertex, entry.draw)) continue;
         if (fieldValue(current, patch) != sourceValue(patch.source, userData, words, vertex, draw)) continue;
@@ -298,6 +364,24 @@ std::optional<LearnFail> learn(Entry& entry, const std::vector<Run>& runs, std::
     for (std::uint32_t b = 0; b < current.bindings.size(); ++b) {
         const auto& was = previous.bindings[b];
         const auto& is = current.bindings[b];
+        if (bufferQuads(is)) {
+            for (std::uint32_t e = 0; e < is.count; ++e) {
+                const auto* x = was.guestDescriptor.data() + static_cast<std::size_t>(e) * 4u;
+                const auto* y = is.guestDescriptor.data() + static_cast<std::size_t>(e) * 4u;
+                if ((x[1] >> 16u) != (y[1] >> 16u) || x[3] != y[3]) return FailDescriptor;
+                const auto before64 = addressOf(was, e);
+                const auto now64 = addressOf(is, e);
+                if (before64 != now64 && !covered(FieldKind::Address, b, e)) {
+                    const auto source = findAddressSource(before, now, before64, now64);
+                    if (!source) return FailNoSource;
+                    patches.push_back({FieldKind::Address, b, e, *source, 0, false});
+                }
+                if (x[2] != y[2] && !covered(FieldKind::Binding, b, e * 4u + 2u)) {
+                    if (!add(FieldKind::Binding, b, e * 4u + 2u, x[2], y[2])) return FailNoSource;
+                }
+            }
+            continue;
+        }
         for (std::uint32_t w = 0; w < is.guestDescriptor.size(); ++w) {
             if (was.guestDescriptor[w] == is.guestDescriptor[w] || covered(FieldKind::Binding, b, w)) continue;
             if (!add(FieldKind::Binding, b, w, was.guestDescriptor[w], is.guestDescriptor[w])) return FailNoSource;
@@ -504,6 +588,10 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     }
     bool changed = false;
     for (const auto& patch : entry.patches) {
+        if (patch.kind == FieldKind::Address) {
+            if (addressValue(patch.source, userData, words, vertex, draw) != addressOf(entry.result->bindings[patch.binding], patch.word)) changed = true;
+            continue;
+        }
         if (patch.source.delta != 0 && overflows(sourceBase(patch.source, userData, words, vertex, draw), patch.source.delta) != patch.overflow) return missed(MissCarry);
         if (sourceValue(patch.source, userData, words, vertex, draw) != fieldValue(*entry.result, patch)) changed = true;
     }
@@ -516,6 +604,13 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     if (changed) {
         auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*entry.result);
         for (const auto& patch : entry.patches) {
+            if (patch.kind == FieldKind::Address) {
+                const auto address = addressValue(patch.source, userData, words, vertex, draw);
+                auto* quad = result->bindings[patch.binding].guestDescriptor.data() + static_cast<std::size_t>(patch.word) * 4u;
+                quad[0] = static_cast<std::uint32_t>(address);
+                quad[1] = (quad[1] & 0xffff0000u) | static_cast<std::uint32_t>(address >> 32u);
+                continue;
+            }
             const auto patched = sourceValue(patch.source, userData, words, vertex, draw);
             if (patch.kind == FieldKind::Binding) result->bindings[patch.binding].guestDescriptor[patch.word] = patched;
             else std::memcpy(result->pushConstants.data() + patch.word * sizeof(std::uint32_t), &patched, sizeof(patched));
@@ -603,6 +698,7 @@ void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const Sh
         for (std::uint32_t w = 0; w < y.guestDescriptor.size(); ++w) {
             if (x.guestDescriptor[w] == y.guestDescriptor[w]) continue;
             const auto* patch = patchFor(FieldKind::Binding, b, w);
+            if (patch == nullptr && y.role == ShaderRecompiler::DescriptorRole::GuestBuffers && w % 4u < 2u) patch = patchFor(FieldKind::Address, b, w / 4u);
             kind = patch != nullptr ? Kind::Patched : Kind::Unpatched;
             std::snprintf(detail, sizeof(detail), "binding %u (role %u, count %u) word %u: fast 0x%08x full 0x%08x, %s", b, static_cast<unsigned>(y.role), y.count, w, x.guestDescriptor[w], y.guestDescriptor[w], patch == nullptr ? "not patched" : patch->source.kind == SourceKind::User ? "patched from a user word" : patch->source.kind == SourceKind::Word ? "patched from a read word" : patch->source.kind == SourceKind::Draw ? "patched from a draw parameter" : "patched from a vertex word");
             break;
