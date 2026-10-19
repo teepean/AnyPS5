@@ -114,7 +114,30 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        const auto memoryCopy = opcode == 0x50 ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
+        const auto copyOnGpu = [&](bool fallBack) {
+            const auto& copy = memoryCopy;
+            if (!copy.has_value() || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return;
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                if (outcome.path == 1 || outcome.path == 3) {
+                    wroteOnGpu = true;
+                    drained = false;
+                } else if (fallBack && outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
+                    Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
+                    if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
+                    ++copiesToHostMemory;
+                    orderedAlready = true;
+                    drained = false;
+                }
+            }
+        };
+        static const bool cpuSourced = std::getenv("APS5_DMA_CPU_SOURCE") != nullptr;
+        if (!cpuSourced && memoryCopy.has_value() && memoryCopy->bytes <= gpuStoreLimit && Graphics::Recorder::SnapshotWriteOverlaps(memoryCopy->source, memoryCopy->bytes)) copyOnGpu(false);
+        if (const auto store = drained ? Pm4::ResolveStore(packet, queue, gpuStoreLimit) : std::nullopt) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
@@ -146,27 +169,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }
         }
-        if (drained && opcode == 0x50) {
-            const auto copy = Pm4::DecodeMemoryCopy(packet);
-            if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                if (const auto localDevice = device.Load()) {
-                    recordDeferredLabels(localDevice.get(), submission.queue);
-                    const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
-                    if (outcome.path == 1 || outcome.path == 3) {
-                        wroteOnGpu = true;
-                        drained = false;
-                    } else if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
-                        Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
-                        if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
-                        ++copiesToHostMemory;
-                        orderedAlready = true;
-                        drained = false;
-                    }
-                }
-            }
-        }
+        if (drained && memoryCopy.has_value() && memoryCopy->bytes > gpuStoreLimit) copyOnGpu(true);
         if (drained && opcode == 0x50 && Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) {
             const auto destination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
             const std::size_t bytes = packet[6] & 0x3ffffffu;
