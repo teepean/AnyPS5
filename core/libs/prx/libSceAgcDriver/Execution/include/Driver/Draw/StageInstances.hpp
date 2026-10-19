@@ -29,6 +29,7 @@ std::uint64_t StageInstanceKey(const void* shader, std::uint64_t codeAddress, st
 struct StageInstanceHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     ShaderRecompiler::SrtUserDataUse userDataUse;
+    bool check = false;
 };
 std::array<std::uint32_t, 5> StageInstanceDrawWords(const ShaderRecompiler::RecompileRequest& request);
 std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory);

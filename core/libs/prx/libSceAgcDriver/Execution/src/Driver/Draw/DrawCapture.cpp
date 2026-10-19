@@ -43,7 +43,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         fastRegions = shaderMemory.TakeRecentRegions();
         if (hit) {
             fastResult = hit->compiled;
-            if (!StageInstancesVerify()) {
+            if (!StageInstancesVerify() && !hit->check) {
                 stageCapture.regions = std::move(fastRegions);
                 stageCapture.supplied = shaderMemory.SuppliedBlocks();
                 stageCapture.userDataUse = std::move(hit->userDataUse);

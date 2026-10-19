@@ -68,6 +68,7 @@ struct Entry {
     std::vector<bool> userPinned;
     bool learned = false;
     bool blocked = false;
+    bool retired = false;
     bool ready = false;
     std::uint32_t stable = 0;
 };
@@ -92,6 +93,8 @@ struct Counters {
     std::uint64_t mismatchedUnpatched = 0;
     std::uint64_t mismatchedShape = 0;
     std::uint64_t regionMismatches = 0;
+    std::uint64_t checks = 0;
+    std::uint64_t retired = 0;
     std::uint64_t fastTimed = 0;
     double fastUs = 0.0;
     std::uint64_t fullTimed = 0;
@@ -480,6 +483,8 @@ void report(State& value) {
         std::snprintf(piece, sizeof(piece), " %s %llu", LearnFailNames[f], static_cast<unsigned long long>(c.failed[f]));
         line += piece;
     }
+    std::snprintf(piece, sizeof(piece), "; self-checks %llu, shapes retired %llu", static_cast<unsigned long long>(c.checks), static_cast<unsigned long long>(c.retired));
+    line += piece;
     std::snprintf(piece, sizeof(piece), "; verify %llu compared, %llu differing results, %llu differing regions (patched %llu, unpatched %llu, shape %llu); fast %.2f us per hit, full %.2f us per capture; %zu entries", static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.mismatched), static_cast<unsigned long long>(c.regionMismatches), static_cast<unsigned long long>(c.mismatchedPatched), static_cast<unsigned long long>(c.mismatchedUnpatched), static_cast<unsigned long long>(c.mismatchedShape), c.fastTimed != 0 ? c.fastUs / static_cast<double>(c.fastTimed) : 0.0, c.fullTimed != 0 ? c.fullUs / static_cast<double>(c.fullTimed) : 0.0, value.entries.size());
     line += piece;
     std::fprintf(stderr, "%s\n", line.c_str());
@@ -496,6 +501,14 @@ bool StageInstancesEnabled() {
 bool StageInstancesVerify() {
     static const bool verify = std::getenv("APS5_VERIFY_SHAPE_INSTANCES") != nullptr;
     return verify;
+}
+
+std::uint64_t checkEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_SHAPE_INSTANCE_CHECK_EVERY");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : std::uint64_t{64};
+    }();
+    return every;
 }
 
 void StageInstancesBeginDraw(std::uint64_t shapeKey) {
@@ -620,7 +633,8 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
         if (vertex->resources[attribute.location].fields != attribute.resource.fields) changed = true;
         if (vertex->fetchEmbedded && vertex->resourcesDst[attribute.location].fetchIndex != attribute.fetchIndex) changed = true;
     }
-    StageInstanceHit hit{entry.result, entry.use};
+    thread_local std::uint64_t served = 0;
+    StageInstanceHit hit{entry.result, entry.use, !StageInstancesVerify() && checkEvery() != 0 && ++served % checkEvery() == 0};
     if (changed) {
         auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*entry.result);
         for (const auto& patch : entry.patches) {
@@ -647,6 +661,7 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
     auto& c = value.counters;
     if (changed) c.patchedWords += entry.patches.size();
     else ++c.shared;
+    if (hit.check) ++c.checks;
     ++c.hits;
     ++c.fastTimed;
     c.fastUs += elapsed;
@@ -675,7 +690,7 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
         if (failure) entry->patches.clear();
     }
     const auto& snapshot = capture.snapshot;
-    entry->blocked = !snapshot.tables.tables.empty() || !snapshot.tables.ranges.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0;
+    entry->blocked = entry->retired || !snapshot.tables.tables.empty() || !snapshot.tables.ranges.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0;
     store(*entry, comparable && !failure.has_value(), shader, std::move(runs), std::move(words), userData, vertex, draw, capture.userDataUse, compiled);
     std::lock_guard lock(value.mutex);
     if (comparable) {
@@ -757,6 +772,15 @@ void StageInstanceCompare(std::uint64_t key, std::uint64_t codeAddress, const Sh
         return flat;
     };
     const bool sameRegions = flatten(fastRegions) == flatten(fullRegions);
+    if (!StageInstancesVerify() && (kind != Kind::Same || !sameRegions) && held != nullptr) {
+        auto retired = std::make_shared<Entry>(*held);
+        retired->blocked = true;
+        retired->retired = true;
+        retired->ready = false;
+        std::lock_guard lock(value.mutex);
+        value.entries[key] = std::move(retired);
+        ++value.counters.retired;
+    }
     {
         std::lock_guard lock(value.mutex);
         auto& c = value.counters;
