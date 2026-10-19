@@ -74,7 +74,14 @@ struct Entry {
     std::uint64_t imageSignature = 0;
 };
 
-constexpr std::size_t Variants = 4;
+std::size_t VariantLimit() {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_SHAPE_VARIANTS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 4ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1, 64));
+    }();
+    return limit;
+}
 
 struct Shape {
     std::vector<std::shared_ptr<const Entry>> variants;
@@ -835,9 +842,9 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
     entry->blocked = entry->retired || !snapshot.tables.tables.empty() || !snapshot.tables.ranges.empty() || !snapshot.srtPoison.empty() || snapshot.nullRootReads != 0;
     store(*entry, comparable && !failure.has_value(), shader, std::move(runs), std::move(words), userData, vertex, draw, capture.userDataUse, compiled);
     auto next = std::make_shared<Shape>();
-    next->variants.reserve(Variants);
+    next->variants.reserve(VariantLimit());
     next->variants.push_back(entry);
-    for (std::size_t v = 0; shape != nullptr && v < shape->variants.size() && next->variants.size() < Variants; ++v) {
+    for (std::size_t v = 0; shape != nullptr && v < shape->variants.size() && next->variants.size() < VariantLimit(); ++v) {
         const auto& kept = shape->variants[v];
         if (kept != previous && kept->shader == shader) next->variants.push_back(kept);
     }
