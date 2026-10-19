@@ -53,6 +53,7 @@ public:
     std::uint64_t DispatchesAdoptedAhead() const;
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
+    void commitSampleDump(std::uint64_t address, std::uint32_t queue);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
     void SubmitFlip(const FlipInfo& info);
     void SuspendPoint();

@@ -105,6 +105,19 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+bool DrawPipeline::AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write) {
+    constexpr std::size_t MaxDumps = 16;
+    std::lock_guard lock(mutex);
+    if (closing || stopped || items.size() < 2) return false;
+    auto& last = items.back();
+    if (!last.labelBytes.empty() || last.dumps.size() >= MaxDumps || (!last.dumps.empty() && last.dumpQueue != queue)) return false;
+    last.dumps.push_back(address);
+    last.dumpQueue = queue;
+    last.writes.push_back(write);
+    ++attachedDumps;
+    return true;
+}
+
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     lastReport = now;
     std::string drainText;
@@ -126,8 +139,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps attached to queued items; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -150,7 +163,11 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            if (commit != nullptr) (*commit)();
+            if (commit != nullptr) {
+                (*commit)();
+                const auto& item = items.front();
+                for (const auto address : item.dumps) Driver::Get().commitSampleDump(address, item.dumpQueue);
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

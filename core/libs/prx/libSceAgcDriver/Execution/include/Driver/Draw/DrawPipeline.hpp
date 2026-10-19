@@ -33,6 +33,7 @@ public:
     static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    bool AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -47,6 +48,8 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::vector<std::uint64_t> dumps;
+        std::uint32_t dumpQueue = 0;
     };
     DrawPipeline() = default;
     void run();
@@ -69,6 +72,7 @@ private:
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
     std::uint64_t enqueued = 0;
+    std::uint64_t attachedDumps = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
