@@ -146,6 +146,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PerformanceTrace::BindThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
@@ -158,7 +159,7 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
         }
-        const auto start = std::chrono::steady_clock::now();
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -177,7 +178,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        const auto spent = elapsedNs(start);
+        const auto spent = profile ? elapsedNs(start) : 0;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
