@@ -10,12 +10,37 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+std::shared_ptr<DrawDecode> recycledDecode(const DrawDecode& source) {
+    constexpr std::size_t Slots = 64;
+    thread_local std::array<std::shared_ptr<DrawDecode>, Slots> pool;
+    thread_local std::size_t next = 0;
+    for (std::size_t tried = 0; tried < Slots; ++tried) {
+        auto& slot = pool[next];
+        next = (next + 1) % Slots;
+        if (slot == nullptr) {
+            slot = std::make_shared<DrawDecode>(source);
+            return slot;
+        }
+        if (slot.use_count() != 1) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        *slot = source;
+        return slot;
+    }
+    return std::make_shared<DrawDecode>(source);
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -159,7 +184,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     if (dataEntry != nullptr) {
-        auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
+        auto refreshed = recycledDecode(*dataEntry->decode);
         for (auto& program : refreshed->programs) {
             ReadUserWords(queue, program, false);
             if (program.merged) InitializeMerged(queue, program, program.mergedPointer, program.mergedPointerRequired, false);
