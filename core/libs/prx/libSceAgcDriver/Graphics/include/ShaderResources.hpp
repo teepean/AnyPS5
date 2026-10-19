@@ -546,7 +546,11 @@ private:
         std::uint64_t unwatched = 0;
         std::uint64_t allocations = 0;
         std::uint64_t depthSurfaces = 0;
+        bool depthRelevant = false;
+        bool pendingExact = false;
         std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        std::vector<std::pair<std::uint64_t, std::size_t>> pendingRanges;
+        std::vector<std::pair<std::uint64_t, std::size_t>> regionRanges;
         std::vector<std::pair<std::uint64_t, std::size_t>> keyRanges;
         std::vector<std::pair<const StorageTexture*, std::uint64_t>> images;
     };

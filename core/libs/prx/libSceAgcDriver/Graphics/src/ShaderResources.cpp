@@ -3168,8 +3168,15 @@ std::size_t ShaderResources::proofMemoMiss() {
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     if (memo.epoch == 0 || epoch == 0) return 3;
     const bool renewed = memo.epoch != epoch;
-    if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || memo.depthSurfaces != DepthSurfacesSerial()) return 4;
-    if (pendingSerialSeen == 0 || pendingSerialSeen != StorageTexture::PendingSerial()) return 5;
+    if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || (memo.depthRelevant && memo.depthSurfaces != DepthSurfacesSerial())) return 4;
+    const auto pendingSerial = StorageTexture::PendingSerial();
+    const bool pendingMoved = pendingSerialSeen == 0 || pendingSerialSeen != pendingSerial;
+    if (pendingMoved) {
+        if (memo.pendingExact || !StorageTexture::PendingSurelyClear(memo.pendingRanges)) return 5;
+        for (const auto& [address, bytes] : memo.regionRanges) {
+            if (AnyShadowedOverlaps(address, bytes)) return 5;
+        }
+    }
     for (const auto& [image, version] : memo.images) {
         if (!image->Cached() || image->Version() != version) return 6;
     }
@@ -3189,6 +3196,7 @@ std::size_t ShaderResources::proofMemoMiss() {
         queries.push_back({address, bytes, memo.generation});
     }
     if (!queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return renewed ? 3 : 9;
+    if (pendingMoved) pendingSerialSeen = StorageTexture::PendingSerial() == pendingSerial ? pendingSerial : 0;
     if (!renewed) return 0;
     memo.epoch = epoch;
     return 10;
@@ -3200,6 +3208,10 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     memo.ranges.clear();
     memo.keyRanges.clear();
     memo.images.clear();
+    memo.pendingRanges.clear();
+    memo.regionRanges.clear();
+    memo.depthRelevant = !storageTextures.empty();
+    memo.pendingExact = false;
     if (before.generation == 0 || before.epoch == 0 || validatedTextures.size() != textures.size()) return;
     const auto addSurface = [&](std::uint64_t address, std::uint64_t bytes, std::uint64_t dccAddress) {
         if (bytes == 0) return;
@@ -3213,12 +3225,16 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (!surface.valid) return;
         if (surface.depth) {
             if (surface.resource.dimension != TextureDimension::k2D) return;
+            memo.depthRelevant = true;
             continue;
         }
         addSurface(surface.resource.baseAddress, surface.bytes, surface.resource.dccAddress);
+        if (surface.bytes != 0) memo.pendingRanges.emplace_back(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
         if (surface.source == nullptr) continue;
+        if (surface.keys != DccKeys::Uncompressed) memo.pendingExact = true;
         const auto& own = surface.source->Descriptor();
         addSurface(own.baseAddress, surface.source->GuestBytes(), own.dccAddress);
+        if (surface.source->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
         memo.images.emplace_back(surface.source, surface.source->Version());
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
@@ -3226,9 +3242,17 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (image == nullptr) return;
         const auto& own = image->Descriptor();
         addSurface(own.baseAddress, image->GuestBytes(), own.dccAddress);
+        if (image->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (i < storageKeys.size() && storageKeys[i] != 0 && storageKeys[i] != own.dccAddress) addSurface(0, image->GuestBytes(), storageKeys[i]);
         memo.images.emplace_back(image, image->Version());
     }
+    for (const auto& region : directRegions) {
+        if (region.end > region.begin) memo.regionRanges.emplace_back(region.begin, static_cast<std::size_t>(region.end - region.begin));
+    }
+    for (const auto& [begin, end] : guestMemory.Writes()) {
+        if (end > begin) memo.regionRanges.emplace_back(begin, static_cast<std::size_t>(end - begin));
+    }
+    memo.pendingRanges.insert(memo.pendingRanges.end(), memo.regionRanges.begin(), memo.regionRanges.end());
     memo.generation = before.generation;
     memo.epoch = before.epoch;
     memo.unwatched = before.unwatched;
