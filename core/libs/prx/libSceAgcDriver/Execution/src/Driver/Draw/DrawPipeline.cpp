@@ -105,16 +105,38 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
-bool DrawPipeline::AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write) {
-    constexpr std::size_t MaxDumps = 16;
-    std::lock_guard lock(mutex);
+bool DrawPipeline::attach(const Follower& follower, std::uint32_t queue) {
+    constexpr std::size_t MaxFollowers = 16;
     if (closing || stopped || items.size() < 2) return false;
     auto& last = items.back();
-    if (!last.labelBytes.empty() || last.dumps.size() >= MaxDumps || (!last.dumps.empty() && last.dumpQueue != queue)) return false;
-    last.dumps.push_back(address);
-    last.dumpQueue = queue;
-    last.writes.push_back(write);
+    if (!last.labelBytes.empty() || last.followers.size() >= MaxFollowers || (!last.followers.empty() && last.followerQueue != queue)) return false;
+    last.followers.push_back(follower);
+    last.followerQueue = queue;
+    return true;
+}
+
+bool DrawPipeline::AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write) {
+    std::lock_guard lock(mutex);
+    if (write.first != address || write.second <= address) return false;
+    Follower follower;
+    follower.address = address;
+    follower.end = write.second;
+    if (!attach(follower, queue)) return false;
     ++attachedDumps;
+    return true;
+}
+
+bool DrawPipeline::AttachLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t opcode, std::uint32_t queue) {
+    if (bytes.empty() || bytes.size() > 8 || opcode > 0xffu) return false;
+    std::lock_guard lock(mutex);
+    Follower follower;
+    follower.address = address;
+    follower.end = address + bytes.size();
+    std::copy(bytes.begin(), bytes.end(), follower.bytes.begin());
+    follower.size = static_cast<std::uint8_t>(bytes.size());
+    follower.opcode = static_cast<std::uint8_t>(opcode);
+    if (!attach(follower, queue)) return false;
+    ++attachedLabels;
     return true;
 }
 
@@ -139,8 +161,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps attached to queued items; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps and %llu labels attached to queued items; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = attachedLabels = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -167,7 +189,10 @@ void DrawPipeline::run() {
             if (commit != nullptr) {
                 (*commit)();
                 const auto& item = items.front();
-                for (const auto address : item.dumps) Driver::Get().commitSampleDump(address, item.dumpQueue);
+                for (const auto& follower : item.followers) {
+                    if (follower.size == 0) Driver::Get().commitSampleDump(follower.address, item.followerQueue);
+                    else Driver::Get().commitAttachedLabel(item.followerQueue, follower.opcode, follower.address, std::span(follower.bytes.data(), follower.size));
+                }
             }
         } catch (const std::exception&) {
             failed = true;
@@ -240,6 +265,13 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        for (auto follower = item->followers.rbegin(); follower != item->followers.rend(); ++follower) {
+            if (!(address < follower->end && follower->address < end)) continue;
+            if (follower->size == 0 || address < follower->address || end > follower->end) return std::nullopt;
+            std::uint64_t value = 0;
+            std::memcpy(&value, follower->bytes.data() + (address - follower->address), bytes);
+            return value;
+        }
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
         if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
@@ -256,6 +288,9 @@ bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
             if (address < limit && begin < end) return true;
+        }
+        for (const auto& follower : item.followers) {
+            if (address < follower.end && follower.address < end) return true;
         }
     }
     return false;

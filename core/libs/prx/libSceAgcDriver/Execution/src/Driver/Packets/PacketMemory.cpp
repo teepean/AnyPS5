@@ -279,6 +279,11 @@ bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std:
     return true;
 }
 
+void Driver::commitAttachedLabel(std::uint32_t queue, std::uint32_t opcode, std::uint64_t address, std::span<const std::byte> bytes) {
+    GuestMemory::SetCurrentPacket(opcode, queue);
+    commitLabel(queue, address, bytes, false);
+}
+
 void Driver::commitSampleDump(std::uint64_t address, std::uint32_t queue) {
     GuestMemory::SetCurrentPacket(0x46, queue);
     bool wrote = false;
@@ -408,6 +413,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         writes.emplace_back(address, address + bytes.size());
     }
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
+    if (!endOfPipeInterrupt && label.has_value() && DrawPipeline::Queue0().AttachLabel(address, bytes, opcode, queue)) return true;
     auto stored = bytes;
     DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);

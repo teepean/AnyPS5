@@ -14,6 +14,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -34,6 +35,7 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     bool AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write);
+    bool AttachLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t opcode, std::uint32_t queue);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -43,14 +45,22 @@ public:
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
 
 private:
+    struct Follower {
+        std::uint64_t address = 0;
+        std::uint64_t end = 0;
+        std::array<std::byte, 8> bytes{};
+        std::uint8_t size = 0;
+        std::uint8_t opcode = 0;
+    };
     struct Item {
         Commit commit;
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
-        std::vector<std::uint64_t> dumps;
-        std::uint32_t dumpQueue = 0;
+        std::vector<Follower> followers;
+        std::uint32_t followerQueue = 0;
     };
+    bool attach(const Follower& follower, std::uint32_t queue);
     DrawPipeline() = default;
     void run();
     void rethrowFailure();
@@ -73,6 +83,7 @@ private:
     std::uint64_t commitErrors = 0;
     std::uint64_t enqueued = 0;
     std::uint64_t attachedDumps = 0;
+    std::uint64_t attachedLabels = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};

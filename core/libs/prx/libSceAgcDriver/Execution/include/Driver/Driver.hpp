@@ -54,6 +54,7 @@ public:
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
     void commitSampleDump(std::uint64_t address, std::uint32_t queue);
+    void commitAttachedLabel(std::uint32_t queue, std::uint32_t opcode, std::uint64_t address, std::span<const std::byte> bytes);
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
     void SubmitFlip(const FlipInfo& info);
     void SuspendPoint();
