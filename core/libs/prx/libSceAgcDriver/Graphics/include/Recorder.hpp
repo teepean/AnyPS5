@@ -559,6 +559,8 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        mutable std::vector<std::pair<std::uint64_t, std::uint64_t>> mergedWrites;
+        mutable std::size_t mergedCount = 0;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
@@ -790,6 +792,7 @@ private:
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
+    static const std::vector<std::pair<std::uint64_t, std::uint64_t>>& mergedWritesOf(const Batch& batch);
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).

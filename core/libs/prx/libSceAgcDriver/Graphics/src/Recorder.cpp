@@ -2946,6 +2946,23 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Recorder::mergedWritesOf(const Batch& batch) {
+    auto& merged = batch.mergedWrites;
+    if (batch.mergedCount == batch.writes.size()) return merged;
+    const auto middle = static_cast<std::ptrdiff_t>(merged.size());
+    merged.insert(merged.end(), batch.writes.begin() + static_cast<std::ptrdiff_t>(batch.mergedCount), batch.writes.end());
+    std::sort(merged.begin() + middle, merged.end());
+    std::inplace_merge(merged.begin(), merged.begin() + middle, merged.end());
+    std::size_t out = 0;
+    for (const auto& [begin, end] : merged) {
+        if (out != 0 && begin <= merged[out - 1].second) merged[out - 1].second = std::max(merged[out - 1].second, end);
+        else merged[out++] = {begin, end};
+    }
+    merged.resize(out);
+    batch.mergedCount = batch.writes.size();
+    return merged;
+}
+
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
@@ -2976,12 +2993,18 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
             merged->reserve(previous->size() + additions.size());
             merged->insert(merged->end(), previous->begin(), previous->end());
             merged->insert(merged->end(), additions.begin(), additions.end());
+            std::sort(merged->begin(), merged->end());
         } else {
-            if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
-            for (const auto& batch : inFlight) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
-            for (const auto* batch : finishing) merged->insert(merged->end(), batch->writes.begin(), batch->writes.end());
+            const auto append = [&](const Batch& batch) {
+                const auto& sorted = mergedWritesOf(batch);
+                const auto middle = static_cast<std::ptrdiff_t>(merged->size());
+                merged->insert(merged->end(), sorted.begin(), sorted.end());
+                std::inplace_merge(merged->begin(), merged->begin() + middle, merged->end());
+            };
+            if (open != nullptr) append(*open);
+            for (const auto& batch : inFlight) append(*batch);
+            for (const auto* batch : finishing) append(*batch);
         }
-        std::sort(merged->begin(), merged->end());
         std::size_t out = 0;
         for (const auto& [begin, end] : *merged) {
             if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
