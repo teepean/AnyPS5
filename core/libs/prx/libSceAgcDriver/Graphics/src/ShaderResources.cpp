@@ -2661,6 +2661,11 @@ struct RevalidateProfile {
 
 constexpr std::array<const char*, 11> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges", "renewed"};
 
+bool OwnPendingMemo() {
+    static const bool enabled = std::getenv("APS5_OWN_PENDING_MEMO") != nullptr;
+    return enabled;
+}
+
 bool RangedAllocationMemo() {
     static const bool enabled = std::getenv("APS5_RANGED_ALLOCATION_MEMO") != nullptr;
     return enabled;
@@ -3188,7 +3193,8 @@ std::size_t ShaderResources::proofMemoMiss() {
     const auto pendingSerial = StorageTexture::PendingSerial();
     const bool pendingMoved = pendingSerialSeen == 0 || pendingSerialSeen != pendingSerial;
     if (pendingMoved) {
-        if (memo.pendingExact || !StorageTexture::PendingSurelyClear(memo.pendingRanges)) return 5;
+        if (memo.pendingExact) return 5;
+        if (!StorageTexture::PendingSurelyClear(memo.pendingRanges) && !(OwnPendingMemo() && StorageTexture::PendingClearExcept(memo.pendingRanges, memo.pendingExcepts))) return 5;
         for (const auto& [address, bytes] : memo.regionRanges) {
             if (AnyShadowedOverlaps(address, bytes)) return 5;
         }
@@ -3225,6 +3231,7 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     memo.keyRanges.clear();
     memo.images.clear();
     memo.pendingRanges.clear();
+    memo.pendingExcepts.clear();
     memo.regionRanges.clear();
     memo.depthRelevant = !storageTextures.empty();
     memo.pendingExact = false;
@@ -3245,12 +3252,18 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
             continue;
         }
         addSurface(surface.resource.baseAddress, surface.bytes, surface.resource.dccAddress);
-        if (surface.bytes != 0) memo.pendingRanges.emplace_back(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+        if (surface.bytes != 0) {
+            memo.pendingRanges.emplace_back(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+            memo.pendingExcepts.push_back(surface.source);
+        }
         if (surface.source == nullptr) continue;
         if (surface.keys != DccKeys::Uncompressed) memo.pendingExact = true;
         const auto& own = surface.source->Descriptor();
         addSurface(own.baseAddress, surface.source->GuestBytes(), own.dccAddress);
-        if (surface.source->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
+        if (surface.source->GuestBytes() != 0) {
+            memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
+            memo.pendingExcepts.push_back(surface.source);
+        }
         memo.images.emplace_back(surface.source, surface.source->Version());
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
@@ -3258,7 +3271,10 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (image == nullptr) return;
         const auto& own = image->Descriptor();
         addSurface(own.baseAddress, image->GuestBytes(), own.dccAddress);
-        if (image->GuestBytes() != 0) memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        if (image->GuestBytes() != 0) {
+            memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+            memo.pendingExcepts.push_back(image);
+        }
         if (i < storageKeys.size() && storageKeys[i] != 0 && storageKeys[i] != own.dccAddress) addSurface(0, image->GuestBytes(), storageKeys[i]);
         memo.images.emplace_back(image, image->Version());
     }
@@ -3269,6 +3285,7 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
         if (end > begin) memo.regionRanges.emplace_back(begin, static_cast<std::size_t>(end - begin));
     }
     memo.pendingRanges.insert(memo.pendingRanges.end(), memo.regionRanges.begin(), memo.regionRanges.end());
+    memo.pendingExcepts.resize(memo.pendingRanges.size(), nullptr);
     memo.generation = before.generation;
     memo.epoch = before.epoch;
     memo.unwatched = before.unwatched;
