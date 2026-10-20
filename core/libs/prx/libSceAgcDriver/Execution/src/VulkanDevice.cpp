@@ -2100,7 +2100,7 @@ bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult
         std::lock_guard pipelines(state->computePipelinesMutex);
         if (state->computePipelines.contains(key) || state->computePipelinesBuilding.contains(key)) return false;
     }
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
     const auto layouts = Graphics::DescribeSetLayouts(context, shaders);
     auto objects = createComputePipeline(context, shader, layouts.layouts.main, layouts.mainKey, pushConstants ? VK_SHADER_STAGE_COMPUTE_BIT : 0u, 0);
@@ -2243,7 +2243,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
     if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
@@ -2306,7 +2306,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     constexpr std::size_t bytes = Pm4::SampleDumpBytes;
     if (OpportunisticReap()) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
     const auto* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) return false;
@@ -2327,7 +2327,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
     if (OpportunisticReap()) recorder.Reap();
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
@@ -2654,7 +2654,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
             outcome.readerOpen = reader->open;
         }
     }
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     // The ordering decision of FillBuffer, for both ranges: GPU stores recorded earlier are ordered
     // before the transfer (or the device copy below) by its barrier; a store a batch's completion
     // makes on the CPU must land before the copy reads the source or writes the destination, so
@@ -3619,10 +3619,12 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
-Graphics::Context VulkanDevice::graphicsContext() const {
+const Graphics::Context& VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    return buildContext();
+    thread_local Graphics::Context built;
+    built = buildContext();
+    return built;
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -3736,7 +3738,7 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
 
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
     Graphics::State state{};
     state.stages = stages;
@@ -3782,7 +3784,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
@@ -4316,7 +4318,7 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
     if (!outcome.recorded) {
         switch (outcome.miss) {
@@ -4399,7 +4401,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     auto prepared = std::make_shared<PreparedDispatch>();
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
@@ -4914,7 +4916,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         throw std::runtime_error("Vulkan dispatch: compute push constant range exceeds device limit");
     }
     auto pushBytes = Graphics::AssemblePushConstants(shaders);
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::shared_ptr<ComputePipelineObjects> objects = prepared != nullptr ? prepared->objects : nullptr;
     if (objects == nullptr && !pipelineKey.identity.Empty()) {
@@ -5220,7 +5222,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& counters = Recipes().kinds[hit->indirect ? 1 : 0];
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
-    const auto context = graphicsContext();
+    const auto& context = graphicsContext();
     if (recipe.needsCompletion || recipe.holdsLease || !hit->resources->Reusable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.
