@@ -3538,7 +3538,7 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if (!eager && borrowedUnits.empty() && first + count <= trackedLayers && std::all_of(layerPending.begin() + first, layerPending.begin() + first + count, [](bool pending) { return pending; })) {
+    if (!eager && borrowedUnits.empty() && first + count <= trackedLayers && std::memchr(layerPending.data() + first, 0, count) == nullptr) {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         if (dirty && !lent) {
@@ -5000,7 +5000,7 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
         }
         if (present < storeWholeUntil || ++partialStores > pieces) {
             storeWholeUntil = present + window;
-            layers = layerPending;
+            layers.assign(layerPending.begin(), layerPending.end());
             coalescedWriteBacks.fetch_add(1, std::memory_order_relaxed);
         }
     }
