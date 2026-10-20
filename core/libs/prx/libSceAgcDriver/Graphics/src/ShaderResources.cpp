@@ -601,6 +601,31 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
     return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
 }
 
+bool lookupKeyProofs() {
+    static const bool enabled = std::getenv("APS5_NO_LOOKUP_KEY_PROOFS") == nullptr;
+    return enabled;
+}
+
+DccKeys lookupClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes) {
+    if (resource.dccAddress == 0 || !lookupKeyProofs()) return TextureClearKeys(resource, guestBytes);
+    constexpr std::size_t MaxProofs = 4096;
+    struct Proofs {
+        std::mutex mutex;
+        std::unordered_map<std::uint64_t, std::pair<std::uint64_t, DccKeyProof>> entries;
+    };
+    static Proofs proofs;
+    DccKeyProof proof;
+    {
+        std::lock_guard lock(proofs.mutex);
+        if (const auto found = proofs.entries.find(resource.dccAddress); found != proofs.entries.end() && found->second.first == guestBytes) proof = found->second.second;
+    }
+    const auto keys = ProvedClearKeys(resource, guestBytes, proof);
+    std::lock_guard lock(proofs.mutex);
+    if (proofs.entries.size() >= MaxProofs && !proofs.entries.contains(resource.dccAddress)) proofs.entries.clear();
+    proofs.entries[resource.dccAddress] = {guestBytes, proof};
+    return keys;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     if (resource.dimension == TextureDimension::k2DMsaa) {
@@ -640,7 +665,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto scanKeys = [&] {
         if (scanned.has_value()) return *scanned;
         const auto scanStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        scanned = TextureClearKeys(resource, guestBytes);
+        scanned = lookupClearKeys(resource, guestBytes);
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return *scanned;
     };
