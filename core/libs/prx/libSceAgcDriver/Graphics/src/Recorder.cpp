@@ -2716,7 +2716,13 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     retireUnwrittenSnapshots(stamp);
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
         unwrittenBytes -= found->second.bytes;
-        unwrittenSnapshots.erase(found);
+        if (bytes > DrawSnapshotBudget - unwrittenBytes) {
+            unwrittenSnapshots.erase(found);
+            return;
+        }
+        found->second = UnwrittenSnapshot{bytes, std::move(buffer), offset, stamp[0]};
+        unwrittenBytes += bytes;
+        return;
     }
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset, stamp[0]});
