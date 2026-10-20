@@ -19,7 +19,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1232,7 +1231,7 @@ struct EpochCollectMap {
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
     std::uint64_t unwatched = 0;
-    std::map<std::uintptr_t, std::uintptr_t> spans;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> spans;
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
@@ -1254,8 +1253,8 @@ bool collectSpansEnabled() {
 constexpr std::size_t CollectSpanLimit = 4096;
 
 bool spanCollected(const EpochCollectMap& map, std::uint64_t unwatched, std::uintptr_t first, std::uintptr_t stop) {
-    if (map.unwatched != unwatched) return false;
-    const auto next = map.spans.upper_bound(first);
+    if (map.unwatched != unwatched || map.spans.empty()) return false;
+    const auto next = std::upper_bound(map.spans.begin(), map.spans.end(), first, [](std::uintptr_t value, const auto& span) { return value < span.first; });
     return next != map.spans.begin() && stop <= std::prev(next)->second;
 }
 
@@ -1264,14 +1263,20 @@ void noteCollectedSpan(EpochCollectMap& map, std::uint64_t unwatched, std::uintp
         map.spans.clear();
         map.unwatched = unwatched;
     }
-    auto next = map.spans.upper_bound(first);
-    if (next != map.spans.begin() && std::prev(next)->second >= first) --next;
-    while (next != map.spans.end() && next->first <= stop) {
-        first = std::min(first, next->first);
-        stop = std::max(stop, next->second);
-        next = map.spans.erase(next);
+    auto begin = std::upper_bound(map.spans.begin(), map.spans.end(), first, [](std::uintptr_t value, const auto& span) { return value < span.first; });
+    if (begin != map.spans.begin() && std::prev(begin)->second >= first) --begin;
+    auto end = begin;
+    while (end != map.spans.end() && end->first <= stop) {
+        first = std::min(first, end->first);
+        stop = std::max(stop, end->second);
+        ++end;
     }
-    map.spans.emplace_hint(next, first, stop);
+    if (end != begin) {
+        *begin = {first, stop};
+        map.spans.erase(begin + 1, end);
+    } else {
+        map.spans.insert(begin, {first, stop});
+    }
 }
 
 bool epochCollectMapEnabled() {
@@ -1367,12 +1372,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (collectSpansEnabled()) {
-                if (spanCollected(map, unwatched, first, stop)) {
-                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                    return tracker.generation.load(std::memory_order_relaxed);
-                }
-            } else if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1385,6 +1385,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
+        }
+        if (epochCollectMapEnabled() && collectSpansEnabled() && spanCollected(epochCollectMap(epoch), unwatched, first, stop)) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            return tracker.generation.load(std::memory_order_relaxed);
         }
     }
     const auto lock = lockTracker(tracker);
@@ -1417,11 +1421,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else {
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
-            if (epochCollectMapEnabled() && collectSpansEnabled()) {
-                noteCollectedSpan(epochCollectMap(epoch), serial, first, stop);
-            } else if (epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
+            if (epochCollectMapEnabled()) {
+                auto& map = epochCollectMap(epoch);
+                auto& entry = map.ranges[first];
                 if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+                if (collectSpansEnabled()) noteCollectedSpan(map, serial, first, stop);
             }
         }
     }
