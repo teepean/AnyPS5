@@ -475,6 +475,8 @@ public:
     }
     std::size_t size() const { return count; }
     bool empty() const { return count == 0; }
+    bool Inline() const { return count <= InlineFlags; }
+    std::uint64_t InlineBits() const { return bits; }
     bool operator[](std::size_t index) const { return count <= InlineFlags ? ((bits >> index) & 1u) != 0 : spill[index]; }
     reference operator[](std::size_t index) { return {*this, index}; }
     bool back() const { return (*this)[count - 1]; }

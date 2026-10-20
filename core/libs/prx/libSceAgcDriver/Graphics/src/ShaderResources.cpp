@@ -2436,6 +2436,12 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     visit(static_cast<std::uint32_t>(program.bindings.size()));
     const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
         visit(static_cast<std::uint32_t>(bits.size()));
+        if (bits.Inline()) {
+            const auto value = bits.InlineBits();
+            if (bits.size() != 0) visit(static_cast<std::uint32_t>(value));
+            if (bits.size() > 32) visit(static_cast<std::uint32_t>(value >> 32u));
+            return;
+        }
         std::uint32_t word = 0;
         for (std::size_t i = 0; i < bits.size(); ++i) {
             if (bits[i]) word |= 1u << (i % 32u);
