@@ -1442,11 +1442,28 @@ public:
         const auto current = published.load(std::memory_order_acquire);
         return current != nullptr && current->version == changes.load(std::memory_order_acquire) && !Overlaps(current->ranges, address, bytes);
     }
+    template<typename Predicate>
+    bool AnyOverlapping(std::uint64_t address, std::size_t bytes, Predicate&& predicate) {
+        if (indexed != version) rebuild();
+        if (bytes == 0 || spans.empty()) return false;
+        const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+        const auto limit = std::lower_bound(spans.begin(), spans.end(), end, [](const Span& span, std::uint64_t value) { return span.begin < value; });
+        for (auto i = static_cast<std::size_t>(limit - spans.begin()); i-- > 0;) {
+            if (reach[i] <= address) break;
+            if (spans[i].end > address && predicate(spans[i].texture)) return true;
+        }
+        return false;
+    }
 
 private:
     struct Snapshot {
         std::uint64_t version = 0;
         Ranges ranges;
+    };
+    struct Span {
+        std::uint64_t begin;
+        std::uint64_t end;
+        StorageTexture* texture;
     };
 
     static bool Overlaps(const Ranges& ranges, std::uint64_t address, std::size_t bytes) {
@@ -1463,7 +1480,14 @@ private:
 
     void rebuild() {
         ranges.clear();
-        for (const auto* texture : textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+        spans.clear();
+        for (auto* texture : textures) {
+            ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+            spans.push_back({texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes(), texture});
+        }
+        std::sort(spans.begin(), spans.end(), [](const Span& a, const Span& b) { return a.begin < b.begin; });
+        reach.resize(spans.size());
+        for (std::size_t i = 0; i < spans.size(); ++i) reach[i] = i == 0 ? spans[i].end : std::max(reach[i - 1], spans[i].end);
         std::sort(ranges.begin(), ranges.end());
         std::size_t merged = 0;
         for (const auto& range : ranges) {
@@ -1476,6 +1500,8 @@ private:
     }
     std::vector<StorageTexture*> textures;
     Ranges ranges;
+    std::vector<Span> spans;
+    std::vector<std::uint64_t> reach;
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
     std::atomic<std::uint64_t> changes{0};
@@ -4065,11 +4091,7 @@ bool StorageTexture::PendingClearExcept(std::span<const std::pair<std::uint64_t,
     std::lock_guard lock(pending.mutex);
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         const auto [address, bytes] = ranges[i];
-        if (pending.textures.MayOverlap(address, bytes)) {
-            for (const auto* texture : pending.textures) {
-                if (texture != excepts[i] && texture->overlaps(address, bytes)) return false;
-            }
-        }
+        if (pending.textures.AnyOverlapping(address, bytes, [&](const StorageTexture* texture) { return texture != excepts[i]; })) return false;
         for (const auto* texture : pending.flushing) {
             if (texture != excepts[i] && texture->overlaps(address, bytes)) return false;
         }
