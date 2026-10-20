@@ -239,11 +239,30 @@ struct HostImports {
 #endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
+    std::vector<const HostImport*> spaceImports;
+    std::uint64_t spaceSerial = 0;
+    std::uint64_t spaceEpoch = 0;
+    std::uint64_t spaceStamp = 0;
+    bool spaceArmed = false;
 };
 
 HostImports& Imports() {
     static HostImports imports;
     return imports;
+}
+
+bool lazyImportStamps() {
+    static const bool lazy = std::getenv("APS5_EAGER_IMPORT_STAMPS") == nullptr;
+    return lazy;
+}
+
+void settleSpaceStamp(HostImports& state) {
+    if (!state.spaceArmed) return;
+    if (state.spaceEpoch == state.epoch) {
+        for (const auto* entry : state.spaceImports) entry->lastUse = std::max(entry->lastUse, state.spaceStamp);
+    }
+    state.spaceImports.clear();
+    state.spaceArmed = false;
 }
 
 #ifdef _WIN32
@@ -333,6 +352,7 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+    settleSpaceStamp(state);
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
 #endif
@@ -435,6 +455,7 @@ void dropTrimmed(HostImports& state, std::uint64_t begin, std::uint64_t end) {
 }
 
 void retireOrTrim(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    settleSpaceStamp(state);
     const auto& entry = it->second;
     const auto entryEnd = entry.base + entry.bytes;
     std::uint64_t first = 0;
@@ -1357,6 +1378,7 @@ bool evictable(const HostImports& state, const HostImport& entry) {
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
+    settleSpaceStamp(state);
     std::uint64_t freed = 0;
     while (freed < wanted) {
         auto oldest = state.imports.end();
@@ -1501,6 +1523,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
 }
 
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+    settleSpaceStamp(state);
     const auto base = run.base;
     const auto bytes = run.bytes;
     auto& failures = joined ? state.failedJoins : state.failed;
@@ -1754,6 +1777,7 @@ bool reattachTrimmed(const Context& context, HostImports& state, HostImport& ent
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
+    settleSpaceStamp(state);
     if (state.device != context.device) {
 #ifdef _WIN32
         drainSettles(state);
@@ -2887,6 +2911,7 @@ void ClearImageMirrors(VkDevice device) {
 void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
+    settleSpaceStamp(state);
     state.parked.erase(device);
 #ifdef _WIN32
     if (device == state.device) drainSettles(state);
@@ -3361,8 +3386,21 @@ void GuestBufferMemory::AcquireRegistered() {
             lap(timing.keepsUs, at);
             if (hit) {
                 const auto stamp = ++state.useCounter;
-                for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                if (!lazyImportStamps()) {
+                    for (const auto& region : current->base) {
+                        if (region.direct != nullptr) region.direct->lastUse = stamp;
+                    }
+                } else {
+                    if (!state.spaceArmed || state.spaceSerial != current->serial || state.spaceEpoch != state.epoch) {
+                        settleSpaceStamp(state);
+                        for (const auto& region : current->base) {
+                            if (region.direct != nullptr) state.spaceImports.push_back(region.direct);
+                        }
+                        state.spaceSerial = current->serial;
+                        state.spaceEpoch = state.epoch;
+                        state.spaceArmed = true;
+                    }
+                    state.spaceStamp = stamp;
                 }
             }
             lap(timing.stampUs, at);
