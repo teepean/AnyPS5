@@ -172,10 +172,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PerformanceTrace::BindThread("draw committer");
+    bool taken = false;
+    Commit* commit = nullptr;
     for (;;) {
-        Commit* commit = nullptr;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (!taken) {
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
@@ -183,6 +184,7 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
         }
+        taken = false;
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;
         bool failed = false;
@@ -219,6 +221,10 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         if (outstanding.fetch_sub(1, std::memory_order_release) == 1 && drainWaiters != 0) idle.notify_all();
+        if (!items.empty()) {
+            commit = stopped ? nullptr : &items.front().commit;
+            taken = true;
+        }
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
