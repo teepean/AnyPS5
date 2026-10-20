@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -70,10 +71,12 @@ public:
                 reported = true;
                 std::fprintf(stderr, "[memory] write watch: cannot register 0x%llx+0x%llx (%s); the range stays unwatched\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), std::strerror(errno));
             }
+            _version.fetch_add(1, std::memory_order_release);
             return;
         }
         insert(_ranges, begin, end);
         insert(_fresh, begin, end);
+        _version.fetch_add(1, std::memory_order_release);
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
@@ -81,13 +84,26 @@ public:
         std::unique_lock lock(_lock);
         const bool watched = remove(_ranges, begin, end);
         remove(_fresh, begin, end);
+        _version.fetch_add(1, std::memory_order_release);
         return watched;
     }
 
     bool Covers(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available()) return false;
-        std::shared_lock lock(_lock);
-        return covers(begin, end);
+        struct Copy {
+            const Watch* owner = nullptr;
+            std::uint64_t version = 0;
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+        };
+        thread_local Copy copy;
+        if (copy.owner != this || copy.version != _version.load(std::memory_order_acquire)) {
+            std::shared_lock lock(_lock);
+            copy.ranges.assign(_ranges.begin(), _ranges.end());
+            copy.version = _version.load(std::memory_order_relaxed);
+            copy.owner = this;
+        }
+        const auto next = std::upper_bound(copy.ranges.begin(), copy.ranges.end(), begin, [](std::uintptr_t value, const auto& range) { return value < range.first; });
+        return next != copy.ranges.begin() && std::prev(next)->second >= end;
     }
 
     bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
@@ -321,6 +337,7 @@ private:
     std::shared_mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
+    std::atomic<std::uint64_t> _version{0};
 };
 
 const bool g_opened = (Watch::Get(), true);
