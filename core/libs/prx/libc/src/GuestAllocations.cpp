@@ -1,5 +1,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -63,6 +64,32 @@ void renewBacking(std::uintptr_t address, std::size_t bytes) {
 }
 
 std::atomic<std::uint64_t> generation{1};
+
+struct ChangeEntry {
+    std::uint64_t generation = 0;
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+};
+
+struct ChangeLog {
+    std::mutex mutex;
+    std::array<ChangeEntry, 4096> entries{};
+    std::uint64_t appended = 0;
+    std::uint64_t lostThrough = 0;
+};
+
+ChangeLog& changeLog() {
+    static auto* value = new ChangeLog;
+    return *value;
+}
+
+void logChange(ChangeLog& log, std::uint64_t changed, std::uintptr_t address, std::size_t bytes) {
+    auto& slot = log.entries[log.appended % log.entries.size()];
+    if (log.appended >= log.entries.size()) log.lostThrough = std::max(log.lostThrough, slot.generation);
+    const auto end = bytes > std::numeric_limits<std::uintptr_t>::max() - address ? std::numeric_limits<std::uintptr_t>::max() : address + bytes;
+    slot = {changed, address, end};
+    ++log.appended;
+}
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
@@ -89,7 +116,12 @@ struct MutationState {
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
     std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
     std::vector<std::pair<std::uintptr_t, std::size_t>> unpinned;
+    bool registered = false;
 };
+
+void noteRegistration(void* mutation) {
+    if (mutation != nullptr) static_cast<MutationState*>(mutation)->registered = true;
+}
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -151,7 +183,16 @@ void* GuestAllocationsBegin_nid_postfix() {
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
     for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes);
-    const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+    std::uint64_t ended = 0;
+    {
+        auto& log = changeLog();
+        std::lock_guard logLock(log.mutex);
+        ended = generation.fetch_add(1, std::memory_order_release) + 1;
+        if (state->registered) logChange(log, ended, 0, std::numeric_limits<std::size_t>::max());
+        for (const auto& [address, bytes] : state->changed) logChange(log, ended, address, bytes);
+        for (const auto& [address, bytes] : state->gpuMapped) logChange(log, ended, address, bytes);
+        for (const auto& [address, bytes] : state->unpinned) logChange(log, ended, address, bytes);
+    }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
@@ -189,8 +230,32 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
     invalidator.store(callback, std::memory_order_release);
 }
 
+bool GuestAllocationsChangedSince_nid_postfix(std::uint64_t since, const std::pair<std::uint64_t, std::uint64_t>* ranges, std::size_t count, std::uint64_t* current) {
+    constexpr std::uint64_t ScanLimit = 256;
+    auto& log = changeLog();
+    std::lock_guard lock(log.mutex);
+    const auto now = generation.load(std::memory_order_acquire);
+    if (current != nullptr) *current = now;
+    if (now == since) return false;
+    if (since < log.lostThrough) return true;
+    const auto held = std::min<std::uint64_t>(log.appended, log.entries.size());
+    for (std::uint64_t k = 0; k < held; ++k) {
+        const auto& entry = log.entries[(log.appended - 1 - k) % log.entries.size()];
+        if (entry.generation <= since) return false;
+        if (k == ScanLimit) return true;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (ranges[i].first < entry.end && entry.begin < ranges[i].second) return true;
+        }
+    }
+    return log.appended > log.entries.size();
+}
+
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
-    generation.fetch_add(1, std::memory_order_release);
+    {
+        auto& log = changeLog();
+        std::lock_guard lock(log.mutex);
+        logChange(log, generation.fetch_add(1, std::memory_order_release) + 1, address, bytes);
+    }
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 
@@ -244,7 +309,8 @@ void registerImage(const void* image) {
 }
 }
 
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
+    noteRegistration(mutation);
     auto& state = registry();
     if (state.mainImageRegistered) return;
     const auto image = GetModuleHandleW(nullptr);
@@ -253,7 +319,8 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     state.mainImageRegistered = true;
 }
 
-void GuestAllocationsRegisterImage_nid_postfix(void*, const void* image) {
+void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image) {
+    noteRegistration(mutation);
     require(image != nullptr, "cannot register a guest image without a base");
     registerImage(image);
 }
@@ -314,7 +381,8 @@ std::uintptr_t registerImagePages(const ImagePages& collected) {
 }
 }
 
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
+    noteRegistration(mutation);
     auto& state = registry();
     if (state.mainImageRegistered) return;
     ImagePages collected{.main = true, .pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE))};
@@ -324,7 +392,8 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     state.mainImageRegistered = true;
 }
 
-void GuestAllocationsRegisterImage_nid_postfix(void*, const void* image) {
+void GuestAllocationsRegisterImage_nid_postfix(void* mutation, const void* image) {
+    noteRegistration(mutation);
     require(image != nullptr, "cannot register a guest image without a base");
     auto& state = registry();
     const auto base = reinterpret_cast<std::uintptr_t>(image);

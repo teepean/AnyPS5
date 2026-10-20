@@ -2661,6 +2661,11 @@ struct RevalidateProfile {
 
 constexpr std::array<const char*, 11> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges", "renewed"};
 
+bool RangedAllocationMemo() {
+    static const bool enabled = std::getenv("APS5_RANGED_ALLOCATION_MEMO") != nullptr;
+    return enabled;
+}
+
 bool ProofMemoEnabled() {
     static const bool disabled = std::getenv("APS5_NO_PROOF_MEMO") != nullptr;
     return !disabled;
@@ -3168,7 +3173,18 @@ std::size_t ShaderResources::proofMemoMiss() {
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     if (memo.epoch == 0 || epoch == 0) return 3;
     const bool renewed = memo.epoch != epoch;
-    if (memo.unwatched != GuestMemory::UnwatchSerial() || memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || (memo.depthRelevant && memo.depthSurfaces != DepthSurfacesSerial())) return 4;
+    if (memo.unwatched != GuestMemory::UnwatchSerial() || (memo.depthRelevant && memo.depthSurfaces != DepthSurfacesSerial())) return 4;
+    if (memo.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        if (!RangedAllocationMemo()) return 4;
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* touchedSlot = nullptr;
+        auto& touched = ShaderRecompiler::ThreadOwned(touchedSlot);
+        touched.clear();
+        for (const auto& [address, bytes] : memo.ranges) touched.emplace_back(address, address + bytes);
+        for (const auto& [address, bytes] : memo.pendingRanges) touched.emplace_back(address, address + bytes);
+        std::uint64_t current = 0;
+        if (GuestAllocations::GuestAllocationsChangedSince_nid_postfix(memo.allocations, touched.data(), touched.size(), &current)) return 4;
+        memo.allocations = current;
+    }
     const auto pendingSerial = StorageTexture::PendingSerial();
     const bool pendingMoved = pendingSerialSeen == 0 || pendingSerialSeen != pendingSerial;
     if (pendingMoved) {
