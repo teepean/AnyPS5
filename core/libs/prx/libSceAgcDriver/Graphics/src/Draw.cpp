@@ -733,11 +733,19 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     auto& key = validationKeyScratch();
     const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
+    thread_local std::vector<std::uint64_t> lastKey;
+    thread_local std::uint32_t lastOutputs = 0;
     if (keyed) {
         memoized = true;
+        if (!lastKey.empty() && key == lastKey) {
+            hit = true;
+            return lastOutputs;
+        }
         std::lock_guard lock(validationMutex());
         if (const auto found = memo.find(key); found != memo.end()) {
             hit = true;
+            lastKey = key;
+            lastOutputs = found->second;
             return found->second;
         }
     }
@@ -761,6 +769,8 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
         // A handful of configurations recur; a runaway key space is dropped wholesale.
         if (memo.size() >= 1024) memo.clear();
         memo.emplace(key, outputs);
+        lastKey = key;
+        lastOutputs = outputs;
     }
     return outputs;
 }
