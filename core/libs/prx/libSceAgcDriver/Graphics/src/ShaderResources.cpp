@@ -5419,6 +5419,11 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+bool RepeatedDrawBindings() {
+    static const bool enabled = std::getenv("APS5_NO_REPEATED_DRAW_BINDINGS") == nullptr;
+    return enabled;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
@@ -5518,6 +5523,21 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    const auto keepBuffers = [&](const DrawBindings& bindings) {
+        const Buffer* kept = nullptr;
+        for (const auto& snapshot : bindings.snapshots) {
+            if (snapshot.buffer.get() == kept) continue;
+            kept = snapshot.buffer.get();
+            recorder.KeepBytes(kept, snapshot.buffer->Bytes().size());
+        }
+    };
+    if (!movedOnly && RepeatedDrawBindings()) {
+        if (auto last = lastDrawBindings.lock(); last != nullptr && last->cache == context.descriptorCache && lastDrawSelected == selected && last->snapshots.size() == result->snapshots.size() && std::equal(last->snapshots.begin(), last->snapshots.end(), result->snapshots.begin(), [](const DrawBindings::Snapshot& a, const DrawBindings::Snapshot& b) { return a.address == b.address && a.buffer == b.buffer && a.offset == b.offset && a.bytes == b.bytes; })) {
+            recorder.Keep(last);
+            keepBuffers(*last);
+            return last;
+        }
+    }
     result->cache = context.descriptorCache;
     if (bufferSlots.size() != descriptorBuffers.size() || allocationOffsets.size() != allocations.size()) {
         bufferSlots.assign(descriptorBuffers.size(), BufferSlot{0, 0, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
@@ -5627,11 +5647,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     result->owner = ownedSets;
     recorder.Keep(result);
-    const Buffer* kept = nullptr;
-    for (const auto& snapshot : result->snapshots) {
-        if (snapshot.buffer.get() == kept) continue;
-        kept = snapshot.buffer.get();
-        recorder.KeepBytes(kept, snapshot.buffer->Bytes().size());
+    keepBuffers(*result);
+    if (!movedOnly) {
+        lastDrawBindings = result;
+        lastDrawSelected = selected;
     }
     return result;
 }
