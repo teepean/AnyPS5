@@ -1810,22 +1810,54 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
+struct LastKept {
+    const Recorder* recorder = nullptr;
+    const void* batch = nullptr;
+    std::uint64_t serial = 0;
+    const ShaderResources* resources = nullptr;
+    const Pipeline* pipeline = nullptr;
+    const Framebuffer* framebuffer = nullptr;
+    std::vector<const StorageTexture*> targets;
+};
+
+LastKept& lastKept() {
+    thread_local LastKept value;
+    return value;
+}
+
+bool KeptRepeat() {
+    static const bool enabled = std::getenv("APS5_NO_KEPT_REPEAT") == nullptr;
+    return enabled;
+}
+
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
-    resources->KeepStorageImageBytes(recorder);
-    for (const auto& target : residents) {
-        if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
+    auto& last = lastKept();
+    const bool repeated = KeptRepeat() && !completion && !listed && !checkRecords && !resources->HoldsLease() && inputs.indices == nullptr && inputs.vertexBuffers.empty() && scratch == nullptr && last.recorder == &recorder && last.batch != nullptr && last.batch == recorder.OpenBatch() && last.serial == recorder.OpenSerial() && last.resources == resources.get() && last.pipeline == pipeline.get() && last.framebuffer == framebuffer.get() && std::ranges::equal(targets, last.targets, [](const std::shared_ptr<StorageTexture>& target, const StorageTexture* held) { return target.get() == held; });
+    if (!repeated) {
+        auto kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = targets;
+        resources->KeepStorageImageBytes(recorder);
+        for (const auto& target : targets) {
+            if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
+        }
+        last.resources = resources.get();
+        last.pipeline = kept->pipeline.get();
+        last.framebuffer = kept->framebuffer.get();
+        recorder.Keep(std::move(kept));
+        if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
+        last.recorder = &recorder;
+        last.batch = recorder.OpenBatch();
+        last.serial = recorder.OpenSerial();
+        last.targets.clear();
+        for (const auto& target : targets) last.targets.push_back(target.get());
     }
-    recorder.Keep(kept);
-    if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
+    const auto& residents = targets;
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
     // finishes the recorder up to the open batch, which holds the kept resources and gets the

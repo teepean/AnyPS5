@@ -240,6 +240,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_INDIRECT_DRAW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Pm4.cpp` |  | rejects indirect draw packets at submission validation |
 | `APS5_NO_JOIN_WAW_CHECK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | lets a contiguous store join the pending one without the write-after-write check |
 | `APS5_NO_KEEP_NEW_STORAGE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | does not keep a newly created storage image alive with the open batch |
+| `APS5_NO_KEPT_REPEAT` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | keeps every recorded draw's objects in a kept record of its own, as before, instead of letting a draw that repeats the previous draw's template, pipeline, framebuffer and targets in the same open batch rely on that draw's record |
 | `APS5_NO_KEYS_FILL_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/DccMetadata.cpp` |  | records no memo of GPU-side DCC key fills |
 | `APS5_NO_KEYS_REFILL` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | keeps a covered image's uploaded keys as they were instead of marking them uncompressed after a matching key fill |
 | `APS5_NO_KEYS_RESCAN` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | reuses the DCC keys scanned before the lookup's refresh instead of discarding them for a rescan |
