@@ -1019,10 +1019,22 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return import;
 }
 
+namespace {
+
+std::size_t IndexScanIndices() {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_INDEX_SCAN_MAX");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : Recorder::KeptIndexRangeIndices;
+    }();
+    return limit;
+}
+
+}
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
-    if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
+    if (bytes < IndexScanIndices() * indexSize) {
         indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
         return indices;
     }
