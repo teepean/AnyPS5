@@ -1229,7 +1229,7 @@ bool takeClearedHtile(const DepthTarget& target) {
     return true;
 }
 
-const DepthSurface* drawnDepth = nullptr;
+DepthSurface* drawnDepth = nullptr;
 
 std::atomic<std::uint64_t> surfacesSerial{0};
 std::atomic<std::uint64_t> surfacesReleased{0};
@@ -1492,10 +1492,14 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
-            surface = candidate.get();
-            break;
+    if (drawnDepth != nullptr && drawnDepth->active->load(std::memory_order_acquire) && drawnDepth->context.device == context.device && sameSurface(drawnDepth->target, target)) {
+        surface = drawnDepth;
+    } else {
+        for (const auto& candidate : surfaces()) {
+            if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+                surface = candidate.get();
+                break;
+            }
         }
     }
     const bool created = surface == nullptr;
@@ -1532,8 +1536,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface = surfaces().back().get();
     }
     surface->retired = false;
-    const auto owner = depthOwners().find({context.device, target.address});
-    const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
+    const bool inherits = created && [&] {
+        const auto owner = depthOwners().find({context.device, target.address});
+        return owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
+    }();
     surface->clearDepth = target.clearDepth;
     surface->clearStencil = target.clearStencil;
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
