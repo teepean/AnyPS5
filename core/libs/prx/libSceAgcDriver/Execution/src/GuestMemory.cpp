@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1230,6 +1231,8 @@ thread_local ThreadCollectMemo threadCollectMemo;
 struct EpochCollectMap {
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    std::uint64_t unwatched = 0;
+    std::map<std::uintptr_t, std::uintptr_t> spans;
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
@@ -1237,9 +1240,38 @@ EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
     auto& map = ShaderRecompiler::ThreadOwned(slot);
     if (map.epoch != epoch) {
         map.ranges.clear();
+        map.spans.clear();
         map.epoch = epoch;
     }
     return map;
+}
+
+bool collectSpansEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_COLLECT_SPANS") == nullptr;
+    return enabled;
+}
+
+constexpr std::size_t CollectSpanLimit = 4096;
+
+bool spanCollected(const EpochCollectMap& map, std::uint64_t unwatched, std::uintptr_t first, std::uintptr_t stop) {
+    if (map.unwatched != unwatched) return false;
+    const auto next = map.spans.upper_bound(first);
+    return next != map.spans.begin() && stop <= std::prev(next)->second;
+}
+
+void noteCollectedSpan(EpochCollectMap& map, std::uint64_t unwatched, std::uintptr_t first, std::uintptr_t stop) {
+    if (map.unwatched != unwatched || map.spans.size() >= CollectSpanLimit) {
+        map.spans.clear();
+        map.unwatched = unwatched;
+    }
+    auto next = map.spans.upper_bound(first);
+    if (next != map.spans.begin() && std::prev(next)->second >= first) --next;
+    while (next != map.spans.end() && next->first <= stop) {
+        first = std::min(first, next->first);
+        stop = std::max(stop, next->second);
+        next = map.spans.erase(next);
+    }
+    map.spans.emplace_hint(next, first, stop);
 }
 
 bool epochCollectMapEnabled() {
@@ -1335,7 +1367,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            if (collectSpansEnabled()) {
+                if (spanCollected(map, unwatched, first, stop)) {
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
+            } else if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1380,7 +1417,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else {
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
-            if (epochCollectMapEnabled()) {
+            if (epochCollectMapEnabled() && collectSpansEnabled()) {
+                noteCollectedSpan(epochCollectMap(epoch), serial, first, stop);
+            } else if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
             }
