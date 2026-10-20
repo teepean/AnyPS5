@@ -633,13 +633,14 @@ std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0;
 double snapshotRebuildMs = 0;
 
 using WriteRanges = Recorder::WriteRanges;
+using PendingWriteSet = Recorder::PendingWriteSet;
 // The sorted, merged union of the guest ranges every unfinished batch will write. Rebuilt under
 // GuestMemory::GpuMutex (the only writer) and read by the flush hook without it: the lock is the
 // graphics worker's main stall, so a no-overlap access must not wait for another queue's device
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+AtomicSharedPtr<const PendingWriteSet> pendingWrites;
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -652,6 +653,10 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
     // Merged ranges are ordered by both bounds: the first one ending past the access decides.
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first < address + bytes;
+}
+
+bool SnapshotOverlaps(const PendingWriteSet* snapshot, std::uint64_t address, std::size_t bytes) {
+    return snapshot != nullptr && (SnapshotOverlaps(snapshot->base.get(), address, bytes) || SnapshotOverlaps(&snapshot->delta, address, bytes));
 }
 
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
@@ -667,9 +672,43 @@ bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uin
     return it != snapshot->end() && it->first <= address && end <= it->second;
 }
 
+bool SnapshotCovers(const PendingWriteSet* snapshot, std::uint64_t address, std::uint64_t end) {
+    return snapshot != nullptr && (SnapshotCovers(snapshot->base.get(), address, end) || SnapshotCovers(&snapshot->delta, address, end));
+}
+
 bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotCovers(snapshot.get(), address, end);
+}
+
+constexpr std::size_t PendingDeltaLimit = 64;
+
+void coalesceRanges(WriteRanges& ranges) {
+    std::size_t out = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (out != 0 && begin <= ranges[out - 1].second) ranges[out - 1].second = std::max(ranges[out - 1].second, end);
+        else ranges[out++] = {begin, end};
+    }
+    ranges.resize(out);
+}
+
+void insertMergedRange(WriteRanges& ranges, std::pair<std::uint64_t, std::uint64_t> range) {
+    const auto first = std::partition_point(ranges.begin(), ranges.end(), [&](const auto& entry) { return entry.second < range.first; });
+    auto last = first;
+    while (last != ranges.end() && last->first <= range.second) {
+        range.first = std::min(range.first, last->first);
+        range.second = std::max(range.second, last->second);
+        ++last;
+    }
+    ranges.insert(ranges.erase(first, last), range);
+}
+
+WriteRanges mergedRangeUnion(const WriteRanges& a, const WriteRanges& b) {
+    WriteRanges merged;
+    merged.reserve(a.size() + b.size());
+    std::merge(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(merged));
+    coalesceRanges(merged);
+    return merged;
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -1343,10 +1382,21 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
+    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+    if (snapshot == nullptr) return nullptr;
+    if (snapshot->delta.empty()) return snapshot->base;
+    return std::make_shared<WriteRanges>(mergedRangeUnion(*snapshot->base, snapshot->delta));
+}
+
+std::shared_ptr<const Recorder::PendingWriteSet> Recorder::PendingWriteSetSnapshot() {
     return pendingWrites.load(std::memory_order_acquire);
 }
 
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
+    return AgcDriver::Graphics::SnapshotOverlaps(snapshot, address, bytes);
+}
+
+bool Recorder::SnapshotOverlaps(const PendingWriteSet* snapshot, std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(snapshot, address, bytes);
 }
 
@@ -2953,12 +3003,7 @@ const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Recorder::mergedWrit
     merged.insert(merged.end(), batch.writes.begin() + static_cast<std::ptrdiff_t>(batch.mergedCount), batch.writes.end());
     std::sort(merged.begin() + middle, merged.end());
     std::inplace_merge(merged.begin(), merged.begin() + middle, merged.end());
-    std::size_t out = 0;
-    for (const auto& [begin, end] : merged) {
-        if (out != 0 && begin <= merged[out - 1].second) merged[out - 1].second = std::max(merged[out - 1].second, end);
-        else merged[out++] = {begin, end};
-    }
-    merged.resize(out);
+    coalesceRanges(merged);
     batch.mergedCount = batch.writes.size();
     return merged;
 }
@@ -2974,48 +3019,35 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     const bool extend = !additions.empty() && previous != nullptr && previous == owned && publishedWriteRangesValid &&
         std::all_of(additions.begin(), additions.end(), [](const auto& range) { return range.second > range.first; });
     publishedWriteRangesValid = false;
-    auto merged = std::make_shared<WriteRanges>();
-    if (extend && additions.size() == 1) {
-        auto range = additions.front();
-        const auto first = std::partition_point(previous->begin(), previous->end(), [&](const auto& entry) { return entry.second < range.first; });
-        auto last = first;
-        while (last != previous->end() && last->first <= range.second) {
-            range.first = std::min(range.first, last->first);
-            range.second = std::max(range.second, last->second);
-            ++last;
+    auto snapshot = std::make_shared<PendingWriteSet>();
+    if (extend) {
+        snapshot->base = previous->base;
+        snapshot->delta.reserve(previous->delta.size() + additions.size());
+        snapshot->delta = previous->delta;
+        for (const auto& range : additions) insertMergedRange(snapshot->delta, range);
+        if (snapshot->delta.size() > PendingDeltaLimit) {
+            snapshot->base = std::make_shared<WriteRanges>(mergedRangeUnion(*snapshot->base, snapshot->delta));
+            snapshot->delta.clear();
         }
-        merged->reserve(previous->size() - static_cast<std::size_t>(last - first) + 1);
-        merged->insert(merged->end(), previous->begin(), first);
-        merged->push_back(range);
-        merged->insert(merged->end(), last, previous->end());
     } else {
-        if (extend) {
-            merged->reserve(previous->size() + additions.size());
-            merged->insert(merged->end(), previous->begin(), previous->end());
-            merged->insert(merged->end(), additions.begin(), additions.end());
-            std::sort(merged->begin(), merged->end());
-        } else {
-            const auto append = [&](const Batch& batch) {
-                const auto& sorted = mergedWritesOf(batch);
-                const auto middle = static_cast<std::ptrdiff_t>(merged->size());
-                merged->insert(merged->end(), sorted.begin(), sorted.end());
-                std::inplace_merge(merged->begin(), merged->begin() + middle, merged->end());
-            };
-            if (open != nullptr) append(*open);
-            for (const auto& batch : inFlight) append(*batch);
-            for (const auto* batch : finishing) append(*batch);
-        }
-        std::size_t out = 0;
-        for (const auto& [begin, end] : *merged) {
-            if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
-            else (*merged)[out++] = {begin, end};
-        }
-        merged->resize(out);
+        auto merged = std::make_shared<WriteRanges>();
+        const auto append = [&](const Batch& batch) {
+            const auto& sorted = mergedWritesOf(batch);
+            const auto middle = static_cast<std::ptrdiff_t>(merged->size());
+            merged->insert(merged->end(), sorted.begin(), sorted.end());
+            std::inplace_merge(merged->begin(), merged->begin() + middle, merged->end());
+        };
+        if (open != nullptr) append(*open);
+        for (const auto& batch : inFlight) append(*batch);
+        for (const auto* batch : finishing) append(*batch);
+        coalesceRanges(*merged);
+        snapshot->base = std::move(merged);
     }
-    publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
-    publishedWriteRanges = merged;
-    published = merged;
-    pendingWrites.store(std::move(merged), std::memory_order_release);
+    const auto valid = [](const WriteRanges& ranges) { return std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; }); };
+    publishedWriteRangesValid = valid(*snapshot->base) && valid(snapshot->delta);
+    publishedWriteRanges = snapshot;
+    published = snapshot;
+    pendingWrites.store(std::move(snapshot), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

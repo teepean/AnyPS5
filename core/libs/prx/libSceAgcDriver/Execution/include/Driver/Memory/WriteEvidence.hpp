@@ -53,7 +53,7 @@ struct ValidateCounters {
 };
 
 struct PendingView {
-    std::shared_ptr<const Graphics::Recorder::WriteRanges> snapshot;
+    std::shared_ptr<const Graphics::Recorder::PendingWriteSet> snapshot;
     std::uint64_t generation = 0;
     bool loaded = false;
 

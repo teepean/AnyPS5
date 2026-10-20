@@ -17,7 +17,7 @@ void PendingView::Load() {
     if (Driver::validateLegacy()) return;
     const auto current = Graphics::Recorder::PublishGeneration();
     if (loaded && current == generation) return;
-    snapshot = Graphics::Recorder::PendingWriteSnapshot();
+    snapshot = Graphics::Recorder::PendingWriteSetSnapshot();
     generation = current;
     loaded = true;
 }

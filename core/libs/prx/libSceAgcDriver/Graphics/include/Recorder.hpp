@@ -372,8 +372,14 @@ public:
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).
     using WriteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    struct PendingWriteSet {
+        std::shared_ptr<const WriteRanges> base;
+        WriteRanges delta;
+    };
     static std::shared_ptr<const WriteRanges> PendingWriteSnapshot();
+    static std::shared_ptr<const PendingWriteSet> PendingWriteSetSnapshot();
     static bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes);
+    static bool SnapshotOverlaps(const PendingWriteSet* snapshot, std::uint64_t address, std::size_t bytes);
     // A label behind pending completions (CPU write-backs the label must not precede): stored to
     // guest memory by a completion action appended to the open batch, or to the newest in-flight
     // batch when none is open (no empty submission), so it runs after every earlier write-back in
@@ -841,7 +847,7 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
-    mutable std::shared_ptr<const WriteRanges> published;
+    mutable std::shared_ptr<const PendingWriteSet> published;
     std::uint64_t submissions = 0;
     GraphicsBinding boundGraphics;
     std::size_t inFlightKeptBytes = 0;
@@ -890,7 +896,7 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
+    mutable std::weak_ptr<const PendingWriteSet> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;
 };
 
