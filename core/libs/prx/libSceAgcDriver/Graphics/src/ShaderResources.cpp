@@ -3271,7 +3271,9 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
             memo.pendingRanges.emplace_back(own.baseAddress, static_cast<std::size_t>(surface.source->GuestBytes()));
             memo.pendingExcepts.push_back(surface.source);
         }
-        memo.images.emplace_back(surface.source, surface.source->Version());
+        const auto* texture = textures[static_cast<std::size_t>(&surface - validatedTextures.data())].get();
+        const bool follows = texture != nullptr && texture->StorageSource() == surface.source && texture->CopyKind() == Texture::PerUseCopy::None;
+        memo.images.emplace_back(surface.source, follows && OwnPendingMemo() && OwnImageVersionMemo() ? UncheckedVersion : surface.source->Version());
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         const auto* image = storageTextures[i].get();
