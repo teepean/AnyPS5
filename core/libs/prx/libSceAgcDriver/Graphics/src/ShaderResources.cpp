@@ -3132,13 +3132,9 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
-namespace {
-
 bool AnyPendingCpuWrites(const Context& context) {
     if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
-}
-
 }
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {

@@ -1884,8 +1884,13 @@ struct AddressBuildTiming {
     double importsUs = 0;
     double mirrorsUs = 0;
     double compareUs = 0;
+    double keepsUs = 0;
+    double stampUs = 0;
+    double spaceWritesUs = 0;
     std::uint64_t blocksCompared = 0;
     std::uint64_t blocksCopied = 0;
+    std::uint64_t spaceWriteScans = 0;
+    std::uint64_t spaceWriteSkips = 0;
 };
 
 AddressBuildTiming& ThreadAddressTiming() {
@@ -3293,6 +3298,11 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.sums.compareUs += timing.compareUs;
     totals.sums.blocksCompared += timing.blocksCompared;
     totals.sums.blocksCopied += timing.blocksCopied;
+    totals.sums.keepsUs += timing.keepsUs;
+    totals.sums.stampUs += timing.stampUs;
+    totals.sums.spaceWritesUs += timing.spaceWritesUs;
+    totals.sums.spaceWriteScans += timing.spaceWriteScans;
+    totals.sums.spaceWriteSkips += timing.spaceWriteSkips;
     totals.snapshotsUs += snapshotsUs;
     timing = {};
     const auto now = std::chrono::steady_clock::now();
@@ -3304,7 +3314,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f (keeps %.1f, stamps %.1f), imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f, pending CPU writes %.1f (%llu scans, %llu skipped); space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs + totals.sums.keepsUs + totals.sums.stampUs), per(totals.sums.keepsUs), per(totals.sums.stampUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), per(totals.sums.spaceWritesUs), static_cast<unsigned long long>(totals.sums.spaceWriteScans), static_cast<unsigned long long>(totals.sums.spaceWriteSkips), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -3348,12 +3358,14 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
             importFloor = state.useCounter + 1;
+            lap(timing.keepsUs, at);
             if (hit) {
                 const auto stamp = ++state.useCounter;
                 for (const auto& region : current->base) {
                     if (region.direct != nullptr) region.direct->lastUse = stamp;
                 }
             }
+            lap(timing.stampUs, at);
         }
         if (hit) {
             for (auto* mirror : current->sparseMirrors) {
@@ -4204,6 +4216,23 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 void GuestBufferMemory::completeSpaceWrites() const {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& timing = ThreadAddressTiming();
+    if (!AnyPendingCpuWrites(context)) {
+        if (profile) ++timing.spaceWriteSkips;
+        return;
+    }
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct Count {
+        bool profile;
+        AddressBuildTiming& timing;
+        std::chrono::steady_clock::time_point started;
+        ~Count() {
+            if (!profile) return;
+            ++timing.spaceWriteScans;
+            timing.spaceWritesUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        }
+    } count{profile, timing, started};
     const auto& base = space->base;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::size_t> candidates;
