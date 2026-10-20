@@ -2666,6 +2666,13 @@ bool OwnPendingMemo() {
     return enabled;
 }
 
+bool OwnImageVersionMemo() {
+    static const bool enabled = std::getenv("APS5_OWN_IMAGE_VERSION_MEMO") != nullptr;
+    return enabled;
+}
+
+constexpr std::uint64_t UncheckedVersion = std::numeric_limits<std::uint64_t>::max();
+
 bool RangedAllocationMemo() {
     static const bool enabled = std::getenv("APS5_RANGED_ALLOCATION_MEMO") != nullptr;
     return enabled;
@@ -3200,7 +3207,7 @@ std::size_t ShaderResources::proofMemoMiss() {
         }
     }
     for (const auto& [image, version] : memo.images) {
-        if (!image->Cached() || image->Version() != version) return 6;
+        if (!image->Cached() || (version != UncheckedVersion && image->Version() != version)) return 6;
     }
     if (!memo.keyRanges.empty()) {
         const auto* recorder = Recorder::Active();
@@ -3276,7 +3283,7 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
             memo.pendingExcepts.push_back(image);
         }
         if (i < storageKeys.size() && storageKeys[i] != 0 && storageKeys[i] != own.dccAddress) addSurface(0, image->GuestBytes(), storageKeys[i]);
-        memo.images.emplace_back(image, image->Version());
+        memo.images.emplace_back(image, OwnPendingMemo() && OwnImageVersionMemo() ? UncheckedVersion : image->Version());
     }
     for (const auto& region : directRegions) {
         if (region.end > region.begin) memo.regionRanges.emplace_back(region.begin, static_cast<std::size_t>(region.end - region.begin));
