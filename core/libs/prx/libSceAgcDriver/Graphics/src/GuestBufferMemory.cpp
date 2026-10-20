@@ -244,6 +244,10 @@ struct HostImports {
     std::uint64_t spaceEpoch = 0;
     std::uint64_t spaceStamp = 0;
     bool spaceArmed = false;
+    std::array<const HostImport*, 4> recentImports{};
+    std::uint64_t recentEpoch = std::numeric_limits<std::uint64_t>::max();
+    std::size_t recentSize = 0;
+    std::size_t recentNext = 0;
 };
 
 HostImports& Imports() {
@@ -254,6 +258,28 @@ HostImports& Imports() {
 bool lazyImportStamps() {
     static const bool lazy = std::getenv("APS5_EAGER_IMPORT_STAMPS") == nullptr;
     return lazy;
+}
+
+bool recentImportsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_RECENT_IMPORTS") == nullptr;
+    return enabled;
+}
+
+const HostImport* recentImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    if (state.recentEpoch != state.epoch || state.recentSize != state.imports.size()) return nullptr;
+    for (const auto* entry : state.recentImports) {
+        if (entry != nullptr && begin >= entry->base && end <= entry->base + entry->bytes) return entry;
+    }
+    return nullptr;
+}
+
+void rememberImport(HostImports& state, const HostImport* entry) {
+    if (state.recentEpoch != state.epoch || state.recentSize != state.imports.size()) {
+        state.recentImports = {};
+        state.recentEpoch = state.epoch;
+        state.recentSize = state.imports.size();
+    }
+    state.recentImports[state.recentNext++ % state.recentImports.size()] = entry;
 }
 
 void settleSpaceStamp(HostImports& state) {
@@ -3226,8 +3252,20 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 #endif
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
+        if (recentImportsEnabled()) {
+            if (const auto* entry = recentImport(state, address, address + bytes)) {
+                static const bool verify = std::getenv("APS5_VERIFY_RECENT_IMPORTS") != nullptr;
+                if (verify && entry != peekImport(state, address, address + bytes)) {
+                    static std::atomic<std::uint64_t> mismatches{0};
+                    if (mismatches.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[gpu] APS5_VERIFY_RECENT_IMPORTS: recent import 0x%llx+0x%llx differs from the map's for 0x%llx+0x%zx\n", static_cast<unsigned long long>(entry->base), static_cast<unsigned long long>(entry->bytes), static_cast<unsigned long long>(address), bytes);
+                }
+                entry->lastUse = ++state.useCounter;
+                return entry;
+            }
+        }
         if (const auto* entry = findImport(state, address, address + bytes)) {
             entry->lastUse = ++state.useCounter;
+            if (recentImportsEnabled()) rememberImport(state, entry);
             return entry;
         }
     }
