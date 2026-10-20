@@ -534,6 +534,7 @@ void Driver::forgetUnfinishedWrites(QueueWorker& worker, const Submission& submi
 }
 
 void Driver::forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites) {
+    if (worker.unfinishedWrites.empty()) return;
     for (const auto dword : labelWrites) {
         const auto found = worker.unfinishedWrites.find(dword);
         if (found == worker.unfinishedWrites.end()) continue;
