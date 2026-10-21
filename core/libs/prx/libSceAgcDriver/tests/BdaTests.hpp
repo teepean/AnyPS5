@@ -12,7 +12,6 @@ struct BdaTestAccess {
     std::function<std::span<std::byte>(VkDeviceAddress)> addressBytes;
     std::function<void(std::optional<VkDeviceSize>)> limitMemory;
     std::function<std::uint64_t()> allocationAttempts;
-    std::function<void(VkResult)> submitResult;
     std::function<void(std::optional<VkDeviceSize>)> limitImports;
 };
 
