@@ -44,6 +44,7 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    static std::uint64_t HeldReadQueries();
     void ReleaseRunningReads();
 
 private:
