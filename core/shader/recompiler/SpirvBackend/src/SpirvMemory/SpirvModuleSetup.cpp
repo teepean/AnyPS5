@@ -259,6 +259,8 @@ void DefineModule(SpirvEmitterState& state) {
         if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) == state.supportedCapabilities.end()) {
             FailEmit("64-bit buffer atomics need shaderBufferInt64Atomics");
         }
+    }
+    if (state.requirements.bufferU64View) {
         state.module.EmitCapability(spv::CapabilityInt64);
         state.module.EmitCapability(spv::CapabilityInt64Atomics);
     }
@@ -339,12 +341,18 @@ void DefineModule(SpirvEmitterState& state) {
     state.module.EmitCapability(spv::CapabilitySignedZeroInfNanPreserve);
     state.module.EmitExtension("SPV_KHR_float_controls");
     state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
-    if (state.float32FlushToZero) {
+    if (state.float32FlushToZero && std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) != state.supportedCapabilities.end()) {
         state.module.EmitCapability(spv::CapabilityDenormFlushToZero);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormFlushToZero, 32u);
+    } else if (state.float32DenormPreserve && !state.float32FlushToZero) {
+        state.module.EmitCapability(spv::CapabilityDenormPreserve);
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 32u);
     }
-    if (state.requirements.float64) {
-        if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFloat64)) == state.supportedCapabilities.end()) {
+    const bool deviceFloat64 = std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityFloat64)) != state.supportedCapabilities.end();
+    state.integerInterpolation = state.requirements.float64Interpolation && !deviceFloat64;
+    if (state.integerInterpolation) state.module.EmitCapability(spv::CapabilityInt64);
+    if (state.requirements.float64 || (state.requirements.float64Interpolation && deviceFloat64)) {
+        if (!deviceFloat64) {
             throw std::runtime_error("64-bit float instructions need the Float64 capability, which the device lacks");
         }
         state.module.EmitCapability(spv::CapabilityFloat64);

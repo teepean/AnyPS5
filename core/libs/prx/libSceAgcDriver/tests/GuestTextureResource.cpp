@@ -290,9 +290,14 @@ void RunGuestTextureResourceTests() {
     Fields cubeBadArray = cube;
     cubeBadArray.baseArray = 6;
     rejectFields(cubeBadArray, "base array past its last array slice");
-    Fields cubeNotMultiple = cube;
-    cubeNotMultiple.depth = 4;
-    rejectFields(cubeNotMultiple, "multiple of 6");
+    Fields cubeExtraSlice = cube;
+    cubeExtraSlice.depth = 6;
+    result = DecodeTextureResource(pack(cubeExtraSlice));
+    Require(result.baseArray == 0 && result.depthOrLastArray == 6, "a cube descriptor with a slice past its last whole cube lost a slice");
+    Require(DescribeSurface(result).imageLayers == 7, "a cube allocation with a slice past its last whole cube omitted it");
+    Fields cubePartial = cube;
+    cubePartial.depth = 4;
+    rejectFields(cubePartial, "fewer than 6 array slices");
 
     Fields multisampled = base;
     multisampled.typeRaw = 14;
@@ -680,4 +685,21 @@ void RunGuestTextureResourceTests() {
     Fields cornered = base;
     cornered.cornerSample = true;
     Require(!SampledTexturesShareEntry(pack(base), pack(cornered)), "T#s differing in a field next to the feedback fields must not share a sampled texture entry");
+
+    Fields arrayFields = base;
+    arrayFields.typeRaw = 13;
+    arrayFields.depth = 1536;
+    arrayFields.baseArray = 3;
+    const auto arrayWords = pack(arrayFields);
+    std::array<std::uint32_t, 8> narrowed{};
+    Require(FirstLayerDescriptor(arrayWords, narrowed), "a 2D array T# naming more than its base slice must narrow to that slice");
+    const auto slice = DecodeTextureResource(narrowed);
+    const auto whole = DecodeTextureResource(arrayWords);
+    Require(slice.dimension == TextureDimension::k2DArray && slice.baseArray == 3 && slice.depthOrLastArray == 3, "a narrowed 2D array T# must name its base slice alone");
+    Require(slice.baseAddress == whole.baseAddress && slice.width == whole.width && slice.format == whole.format && slice.mipCount == whole.mipCount && slice.tileMode == whole.tileMode, "narrowing a 2D array T# must keep every other field");
+    Require(!SampledTexturesShareEntry(arrayWords, narrowed), "a narrowed 2D array T# must not share the whole array's sampled texture entry");
+    Fields single = arrayFields;
+    single.depth = 3;
+    Require(!FirstLayerDescriptor(pack(single), narrowed), "a 2D array T# of its base slice alone needs no narrowing");
+    Require(!FirstLayerDescriptor(baseWords, narrowed), "a 2D T# needs no narrowing");
 }

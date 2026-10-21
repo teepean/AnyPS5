@@ -182,6 +182,7 @@ struct ShaderPixelStageInfo {
     bool dualSourceBlend;
     bool alphaToCoverage;
     bool stencilRefExportEnable;
+    bool stencilOperationValueExport = false;
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
     bool ditheredAlphaToCoverage = false;
@@ -291,6 +292,7 @@ struct SpirvTarget {
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
+    bool float32DenormPreserve = false;
 };
 
 struct BindingLayout {
@@ -341,6 +343,7 @@ struct TessellationConfiguration {
     bool breakAtInstance = false;
     std::uint32_t instancePatches = 0;
     bool drawParameters = false;
+    bool mergedHull = false;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
@@ -366,12 +369,37 @@ struct GraphicsDrawParameters {
     std::uint32_t instanceCount;
 };
 
+struct FragmentParameter {
+    std::uint32_t location;
+    std::uint32_t sourceLocation;
+    bool flat;
+    bool perVertex;
+    bool custom = false;
+    bool flatP10 = false;
+    bool vertexOrder = false;
+    bool operator==(const FragmentParameter&) const = default;
+};
+
+struct BarycentricEmulation {
+    bool active = false;
+    bool smooth = false;
+    bool linear = false;
+    bool operator==(const BarycentricEmulation&) const = default;
+};
+
+struct MeshBarycentricLayout {
+    BarycentricEmulation emulation;
+    std::vector<FragmentParameter> parameters;
+    bool operator==(const MeshBarycentricLayout&) const = default;
+};
+
 struct GraphicsCompileContext {
     std::uint32_t firstUserSgpr;
     std::span<const LinkedProgram> linkedPrograms;
     std::optional<MeshConfiguration> mesh;
     std::optional<TessellationConfiguration> tessellation;
     GraphicsDrawParameters draw;
+    std::optional<MeshBarycentricLayout> meshBarycentrics;
 };
 
 struct RecompileRequest {
@@ -599,30 +627,31 @@ struct VertexAttribute {
     std::uint32_t formatComponents = 0;
 };
 
-struct FragmentParameter {
-    std::uint32_t location;
-    std::uint32_t sourceLocation;
-    bool flat;
-    bool perVertex;
-    bool custom = false;
-    bool flatP10 = false;
-    bool vertexOrder = false;
-};
-
-struct BarycentricEmulation {
-    bool active = false;
-    bool smooth = false;
-    bool linear = false;
-};
-
 struct BarycentricEmulationLayout {
     static constexpr std::uint32_t NoLocation = 0xffffffffu;
     std::uint32_t smoothLocation = NoLocation;
     std::uint32_t linearLocation = NoLocation;
+    std::uint32_t positionsLocation = NoLocation;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> perVertexLocations;
 };
 
-[[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation);
+[[nodiscard]] BarycentricEmulationLayout LayoutBarycentricEmulation(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation, bool meshPositions = false);
+
+struct EmulatedPerVertexParameter {
+    std::uint32_t sourceLocation;
+    std::uint32_t location;
+};
+
+struct EmulatedInterface {
+    std::vector<std::uint32_t> passed;
+    std::vector<bool> passedFlat;
+    std::vector<EmulatedPerVertexParameter> perVertex;
+    BarycentricEmulationLayout layout;
+    std::uint32_t barycentrics = 0;
+    std::uint32_t sources = 0;
+};
+
+[[nodiscard]] EmulatedInterface DescribeEmulatedInterface(std::span<const FragmentParameter> parameters, const BarycentricEmulation& emulation, bool meshPositions = false);
 
 // A 128-bit hash of a module's words (SharedSpirv::ContentHash), zero for an empty module. The
 // mixing is pure integer arithmetic over the words in order, so the value is the same on every run,
@@ -761,6 +790,7 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
+    std::optional<MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
@@ -774,6 +804,7 @@ struct ShaderInvocation {
     std::vector<std::byte> pushConstants;
     bool readsDepthRemapPush = false;
     std::vector<VertexAttribute> vertexAttributes;
+    std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;
     std::vector<ImageTableEntryPoison> imageTablePoison;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
@@ -820,6 +851,26 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
         return identity;
     }
 };
+
+[[nodiscard]] std::optional<MeshBarycentricLayout> MeshBarycentricLayoutOf(const RecompileResult& fragment);
+
+struct MeshOutputUse {
+    std::uint32_t flatParameters = 0;
+    std::uint32_t perVertexParameters = 0;
+    std::uint32_t clipVaryings = 0;
+    std::uint32_t clipDistances = 0;
+    std::uint32_t cullDistances = 0;
+    bool layer = false;
+};
+
+struct MeshOutputBudget {
+    std::uint32_t vertexLocations = 0;
+    std::uint32_t primitiveLocations = 0;
+    std::uint64_t components = 0;
+    std::uint64_t bytes = 0;
+};
+
+[[nodiscard]] MeshOutputBudget MeshBarycentricOutputBudget(const MeshConfiguration& mesh, const MeshTargetLimits& limits, const MeshOutputUse& use);
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
 

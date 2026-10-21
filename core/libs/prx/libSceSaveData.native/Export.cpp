@@ -18,6 +18,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/RemoveTree.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
@@ -309,6 +310,21 @@ static std::string blocks_path(const std::string& real_path) {
     return real_path + ".blocks";
 }
 
+static bool isMountedDirectory(const std::string& path) {
+    for (const auto& slot : g_slots) {
+        if (!slot.used) continue;
+        if (slot.real_path == path) return true;
+        if (!std::filesystem::exists(path) || !std::filesystem::exists(slot.real_path)) continue;
+        std::error_code error;
+        const bool sameDirectory = std::filesystem::equivalent(slot.real_path, path, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("SaveData: failed to compare save paths", slot.real_path, path, error);
+        }
+        if (sameDirectory) return true;
+    }
+    return false;
+}
+
 static int deleteSave(const SaveDataDelete* del) {
     if (del == nullptr || del->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataDelete: null argument");
@@ -323,24 +339,9 @@ static int deleteSave(const SaveDataDelete* del) {
     }
     const std::string path = save_root() + "/" + dirName;
     std::lock_guard lock(g_slots_mutex);
-    for (const auto& slot : g_slots) {
-        if (!slot.used) {
-            continue;
-        }
-        if (slot.real_path == path) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-        std::error_code ec;
-        const bool same_directory = std::filesystem::equivalent(slot.real_path, path, ec);
-        if (ec && ec != std::errc::no_such_file_or_directory) {
-            throw std::filesystem::filesystem_error("sceSaveDataDelete: failed to compare save paths", slot.real_path, path, ec);
-        }
-        if (same_directory) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-    }
+    if (isMountedDirectory(path)) return SAVE_DATA_ERROR_BUSY;
     if (std::filesystem::is_directory(path)) {
-        std::filesystem::remove_all(path);
+        RemoveTree(path);
     }
     std::error_code ec;
     std::filesystem::remove(param_path(path), ec);
@@ -360,7 +361,7 @@ int APS5_VABI sceSaveDataDeleteTransactionResource(int32_t resource) {
     return SAVE_DATA_OK;
 }
 
-static constexpr std::uint64_t SAVE_DATA_BLOCK_BYTES = 32768;
+static constexpr std::uint64_t SAVE_DATA_BLOCK_BYTES = 65536;
 
 static std::uint64_t save_blocks(const std::string& real_path) {
     std::ifstream file(blocks_path(real_path));
@@ -590,7 +591,7 @@ int APS5_VABI sceSaveDataInitialize3(const void* init) {
 int APS5_VABI sceSaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDataIcon* icon) {
     (void)icon;
     if (mount_point == nullptr) {
-        throw std::runtime_error("sceSaveDataLoadIcon: null mount_point");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     if (find_slot_by_mount_point(mount_point->data) == -1) {
@@ -624,11 +625,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     }
     const std::string real_path = save_root() + "/" + dirName;
     std::lock_guard lock(g_slots_mutex);
-    for (const auto& used : g_slots) {
-        if (used.used && used.real_path == real_path) {
-            return SAVE_DATA_ERROR_BUSY;
-        }
-    }
+    if (isMountedDirectory(real_path)) return SAVE_DATA_ERROR_BUSY;
     const bool exists = std::filesystem::is_directory(real_path);
     if (create && exists) {
         return SAVE_DATA_ERROR_EXISTS;
@@ -676,7 +673,7 @@ int APS5_VABI sceSaveDataPrepare(const SaveDataMountPoint* mount_point, const Sa
 int APS5_VABI sceSaveDataSaveIcon(const SaveDataMountPoint* mount_point, const SaveDataIcon* icon) {
     (void)icon;
     if (mount_point == nullptr) {
-        throw std::runtime_error("sceSaveDataSaveIcon: null mount_point");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     if (find_slot_by_mount_point(mount_point->data) == -1) {
@@ -693,7 +690,7 @@ int APS5_VABI sceSaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, c
 
 static int setParam(const SaveDataMountPoint* mount_point, uint32_t param_type, const void* param_buf, size_t param_buf_size) {
     if (mount_point == nullptr || param_buf == nullptr) {
-        throw std::runtime_error("sceSaveDataSetParam: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     const int slot = find_slot_by_mount_point(mount_point->data);
@@ -851,6 +848,9 @@ int APS5_VABI sceSaveDataSyncSaveDataMemory(const void* sync_param) {
     if (sync_param == nullptr) {
         return SAVE_DATA_ERROR_PARAMETER;
     }
+    if (g_initializations == 0) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
     // Every Set already writes straight through to disk; sync only has to confirm the memory exists.
     const std::int32_t user_id = *static_cast<const std::int32_t*>(sync_param);
     const std::uint32_t slot_id = reinterpret_cast<const std::uint32_t*>(sync_param)[1];
@@ -896,7 +896,7 @@ int APS5_VABI sceSaveDataTransferringMount(const SaveDataTransferringMount* moun
 static int umount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
     (void)mode;
     if (mount_point == nullptr) {
-        throw std::runtime_error("sceSaveDataUmount2: null mount_point");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
     std::lock_guard lock(g_slots_mutex);
     int slot = find_slot_by_mount_point(mount_point->data);
@@ -990,6 +990,51 @@ int APS5_VABI sceSaveDataDirNameSearch2(const SaveDataDirNameSearchCond* cond, S
 }
 
 int APS5_VABI sceSaveDataPrepareForTransferring() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataCheckIpmiIfSize() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebug() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugCheckBackupData() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugCleanMount() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugCompiledSdkVersion() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugCreateSaveDataRoot() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugProspero() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugRemoveSaveDataRoot() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceSaveDataDebugTarget() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

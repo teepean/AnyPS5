@@ -33,7 +33,7 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {});
     bool AttachSampleDump(std::uint64_t address, std::uint32_t queue, Range write);
     bool AttachLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t opcode, std::uint32_t queue);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
@@ -43,6 +43,8 @@ public:
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
+    static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    void ReleaseRunningReads();
 
 private:
     struct Follower {
@@ -57,6 +59,7 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::vector<Range> reads;
         std::vector<Follower> followers;
         std::uint32_t followerQueue = 0;
     };

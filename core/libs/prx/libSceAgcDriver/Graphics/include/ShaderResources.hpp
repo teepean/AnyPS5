@@ -43,6 +43,7 @@ struct TextureCacheUse {
     std::uint64_t storageBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
+void OverrideCacheBudgetForTest(std::uint64_t bytes);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
@@ -74,7 +75,7 @@ struct TableDescriptors {
     std::uint32_t binding = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
     std::vector<VkDescriptorImageInfo> images;
-    std::shared_ptr<const std::vector<std::shared_ptr<Texture>>> textures;
+    std::shared_ptr<const std::vector<std::weak_ptr<Texture>>> textures;
 };
 
 class DescriptorCache {
@@ -281,6 +282,7 @@ public:
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
@@ -310,7 +312,7 @@ public:
     bool DataWordsDiffer(const CompiledShader& shader) const;
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
-    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Count };
+    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Depth, Replaced, Audit, Count };
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
     enum class OwnRefreshFallback : std::size_t { Disabled, Snapshot, Keys, ForeignView, SurfaceKey, NotImported, Uncached, Rerun, Count };
@@ -339,6 +341,9 @@ public:
 private:
     friend class AgcDriver::VulkanDevice;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
+    std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
+    VkBuffer shaderDataBuffer(const CompiledShader& shader) const;
+    void forgetShaderDataWords(const CompiledShader& shader);
     struct DescribedRange {
         const char* kind;
         std::uint64_t address;
@@ -348,6 +353,7 @@ private:
         std::uint32_t format = 0;
         int tileMode = 0;
         std::uint64_t dccAddress = 0;
+        bool imageTable = false;
     };
     std::vector<DescribedRange> describedRanges;
     struct Allocation {
@@ -566,6 +572,7 @@ private:
     GuestBufferMemory guestMemory;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
+    std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
     bool bdaReadOnly = true;
     std::vector<std::uint64_t> multisampleSources;
@@ -597,7 +604,7 @@ private:
         std::vector<std::pair<std::uint32_t, std::uint32_t>> runs;
     };
     std::array<TableWrites, 2> tableWrites;
-    std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::shared_ptr<Texture>>>& held) noexcept;
+    std::shared_ptr<const TableDescriptors> keptTable(std::size_t set, std::shared_ptr<const std::vector<std::weak_ptr<Texture>>>& held) noexcept;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
@@ -627,6 +634,7 @@ private:
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
+    std::chrono::steady_clock::time_point lastFullWalk = std::chrono::steady_clock::now();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;

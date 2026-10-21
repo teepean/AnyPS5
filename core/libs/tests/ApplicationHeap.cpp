@@ -238,6 +238,18 @@ int main(int argc, char** argv) {
         require(frees == 3 && initializes == 1);
         return 0;
     }
+    if (argc > 1 && std::strcmp(argv[1], "sdk-default") == 0) {
+        require(argc == 3);
+        void* sdk = dlopen(argv[2], RTLD_NOW | RTLD_GLOBAL);
+        require(sdk != nullptr && initializes == 1);
+        std::memset(replacement.data() + 0x10, 0, replacement.size() - 0x10);
+        ApplicationHeapInitialize_nid_no_patch(process.data());
+        void* pointer = ApplicationHeapAllocate_nid_no_patch(24);
+        require(pointer != nullptr && pointer != storage.data() && lastSize == 0);
+        ApplicationHeapFree_nid_no_patch(pointer);
+        require(frees == 0 && dlclose(sdk) == 0 && finalizes == 1);
+        return 0;
+    }
 #endif
     if (argc > 1 && std::strcmp(argv[1], "lazy") == 0) {
         installProcessParameters();
@@ -247,6 +259,28 @@ int main(int argc, char** argv) {
         require(frees == 1);
         _init_env_nid_postfix();
         require(initializes == 1);
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "scripting") == 0) {
+        installProcessParameters();
+        constexpr std::size_t blockBytes = 0x40000;
+        auto* first = static_cast<std::byte*>(scriptingGetMem_nid_postfix(0x1000, blockBytes));
+        require(initializes == 0 && lastSize == 0);
+        auto* second = static_cast<std::byte*>(scriptingGetMem_nid_postfix(0x1000, blockBytes));
+        require(initializes == 0 && lastSize == 0);
+        require(first != nullptr && second != nullptr && reinterpret_cast<std::uintptr_t>(first) % 0x1000 == 0 && reinterpret_cast<std::uintptr_t>(second) % 0x1000 == 0);
+        require(first + blockBytes <= second || second + blockBytes <= first);
+        std::memset(first, 0x5a, blockBytes);
+        std::memset(second, 0xa5, blockBytes);
+        require(first[blockBytes - 1] == std::byte{0x5a} && second[0] == std::byte{0xa5});
+        scriptingFreeMem_nid_postfix(first);
+        scriptingFreeMem_nid_postfix(second);
+        require(initializes == 0 && frees == 0);
+        _init_env_nid_postfix();
+        require(initializes == 1);
+        require(_Znwm_nid_postfix(40) == storage.data() && lastSize == 40);
+        _ZdlPv_nid_postfix(storage.data());
+        require(frees == 1);
         return 0;
     }
     if (argc > 1 && std::strcmp(argv[1], "exit-order") == 0) {
@@ -437,14 +471,23 @@ int main(int argc, char** argv) {
     require(getcwd_nid_postfix(nullptr, 0) == nullptr && *__error_nid_postfix() == 12);
     fail = false;
     const auto beforeScripting = frees;
+    const auto sizeBeforeScripting = lastSize;
     scriptingFreeMem_nid_postfix(nullptr);
-    require(frees == beforeScripting);
-    require(scriptingGetMem_nid_postfix(0, 31) == storage.data() && lastAlignment == 16 && lastSize == 31);
-    require(scriptingGetMem_nid_postfix(64, 37) == storage.data() && lastAlignment == 64 && lastSize == 37);
-    scriptingFreeMem_nid_postfix(storage.data());
-    require(frees == beforeScripting + 1);
-    require(scriptingGetMem_nid_postfix(24, 80) == nullptr && lastSize == 37);
+    auto* small = static_cast<std::byte*>(scriptingGetMem_nid_postfix(0, 31));
+    auto* aligned = static_cast<std::byte*>(scriptingGetMem_nid_postfix(64, 37));
+    require(small != nullptr && small != storage.data() && reinterpret_cast<std::uintptr_t>(small) % 16 == 0);
+    require(aligned != nullptr && aligned != storage.data() && reinterpret_cast<std::uintptr_t>(aligned) % 64 == 0);
+    std::memset(small, 0x5a, 31);
+    std::memset(aligned, 0xa5, 37);
+    require(small + 31 <= aligned || aligned + 37 <= small);
+    scriptingFreeMem_nid_postfix(small);
+    scriptingFreeMem_nid_postfix(aligned);
+    require(scriptingGetMem_nid_postfix(24, 80) == nullptr);
+    require(scriptingGetMem_nid_postfix(16, std::numeric_limits<std::size_t>::max()) == nullptr);
     fail = true;
-    require(scriptingGetMem_nid_postfix(16, 64) == nullptr);
+    auto* unaffected = scriptingGetMem_nid_postfix(16, 64);
+    require(unaffected != nullptr);
+    scriptingFreeMem_nid_postfix(unaffected);
     fail = false;
+    require(frees == beforeScripting && lastSize == sizeBeforeScripting);
 }

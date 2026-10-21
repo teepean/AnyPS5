@@ -15,8 +15,6 @@ namespace {
 
 constexpr int PAD_ERROR_DEVICE_NOT_CONNECTED = static_cast<int>(0x80920007);
 constexpr int PAD_ERROR_DEVICE_NO_HANDLE = static_cast<int>(0x80920008);
-constexpr int PAD_UNKNOWN_N3KSX62FGNO_BEFORE_INIT = static_cast<int>(0x80920005);
-constexpr int PAD_UNKNOWN_N3KSX62FGNO_AFTER_INIT = static_cast<int>(0x809200ff);
 
 bool g_opened = false;
 std::atomic_bool g_initialized{false};
@@ -80,8 +78,8 @@ int APS5_VABI scePadGetControllerInformation(int handle, PadControllerInformatio
  }
  std::memset(info, 0, sizeof(*info));
  info->touchPadInfo.pixelDensity = 44.86f;
- info->touchPadInfo.resolution.x = 1920;
- info->touchPadInfo.resolution.y = 943;
+ info->touchPadInfo.resolution.x = kTouchPadWidth;
+ info->touchPadInfo.resolution.y = kTouchPadHeight;
  info->stickInfo.deadZoneLeft = 2;
  info->stickInfo.deadZoneRight = 2;
  info->connectionType = PAD_CONNECTION_TYPE_LOCAL;
@@ -124,8 +122,8 @@ int APS5_VABI scePadGetExtControllerInformation(int handle, void* info) {
  std::memset(info, 0, 0x2c);
  PadControllerInformation* base = static_cast<PadControllerInformation*>(info);
  base->touchPadInfo.pixelDensity = 44.86f;
- base->touchPadInfo.resolution.x = 1920;
- base->touchPadInfo.resolution.y = 943;
+ base->touchPadInfo.resolution.x = kTouchPadWidth;
+ base->touchPadInfo.resolution.y = kTouchPadHeight;
  base->stickInfo.deadZoneLeft = 2;
  base->stickInfo.deadZoneRight = 2;
  base->connectionType = PAD_CONNECTION_TYPE_LOCAL;
@@ -179,13 +177,13 @@ int APS5_VABI scePadOutputReport() { NotImplemented_nid_no_patch(__func__); retu
 
 int APS5_VABI scePadRead_nid_postfix(int handle, PadData* data, int num) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- if (data == nullptr || num <= 0) APS5_INVALID_ARG_EX;
+ if (data == nullptr || num <= 0) return PAD_ERROR_INVALID_ARG;
  return Pad::Read(data, num);
 }
 
 int APS5_VABI scePadReadState(int handle, PadData* data) {
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- if (data == nullptr) APS5_INVALID_ARG_EX;
+ if (data == nullptr) return PAD_ERROR_INVALID_ARG;
 
  *data = Pad::ReadState();
 
@@ -317,8 +315,7 @@ int APS5_VABI scePadSetAngularVelocityBiasCorrectionState(int handle, bool enabl
 
 APS5_EXPORT("n3kSX62fgNo", scePadUnknown_n3kSX62fgNo);
 int APS5_VABI scePadUnknown_n3kSX62fgNo() {
-    if (g_opened) NotImplemented_nid_no_patch(__func__);
-    return g_initialized.load(std::memory_order_acquire) ? PAD_UNKNOWN_N3KSX62FGNO_AFTER_INIT : PAD_UNKNOWN_N3KSX62FGNO_BEFORE_INIT;
+    return g_initialized.load(std::memory_order_acquire) ? PAD_OK : PAD_ERROR_NOT_INITIALIZED;
 }
 
 int APS5_VABI scePadVrControllerGetTriggerEffectStates(void) {
@@ -326,10 +323,12 @@ int APS5_VABI scePadVrControllerGetTriggerEffectStates(void) {
     return 0;
 }
 
-APS5_EXPORT("zBsgF0q8DIM", scePadUnknown_zBsgF0q8DIM);
-int APS5_VABI scePadUnknown_zBsgF0q8DIM() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI scePadGetAccessibilityControllerState(int handle, std::uint32_t* state) {
+    if (!Pad::IsInitialized()) return PAD_ERROR_NOT_INITIALIZED;
+    if (state == nullptr) return PAD_ERROR_INVALID_ARG;
+    if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+    *state = 0;
+    return PAD_OK;
 }
 
 int APS5_VABI scePadSetTriggerEffectExt(void) {

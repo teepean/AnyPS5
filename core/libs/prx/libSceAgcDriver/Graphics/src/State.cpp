@@ -53,6 +53,12 @@ float readFloat(const Registers& registers, std::uint32_t offset) {
     return value;
 }
 
+float readDepthBound(const Registers& registers, std::uint32_t offset) {
+    const auto value = std::bit_cast<float>(read(registers, offset));
+    if (std::isnan(value)) Require(false, "NaN depth bound at DWORD " + std::to_string(offset));
+    return value;
+}
+
 std::string zeroMessage(std::uint32_t offset, std::uint32_t value, const char* name) {
     char detail[64];
     std::snprintf(detail, sizeof(detail), " (register 0x%x = 0x%08x)", offset, value);
@@ -188,8 +194,9 @@ constexpr std::uint32_t PixelShaderIteratesSamples = 0x10000u;
 constexpr std::uint32_t PixelSampleCoverageInput = 0x4000u;
 constexpr std::uint32_t PixelSampleRateInputs = 0x2011u;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
-// Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
-constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x01000000u | 0x0c000000u);
+// Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space;
+// bit 16 disables clipping.
+constexpr std::uint32_t ClipControlMask = ~(0x10000u | 0x80000u | 0x01000000u | 0x0c000000u);
 
 bool zFormatSupported(std::uint32_t format) {
     return format == 0u || format == 1u || format == 2u || format == 3u || format == 9u;
@@ -198,10 +205,11 @@ bool zFormatSupported(std::uint32_t format) {
 std::uint32_t shaderControlMask(std::uint32_t zFormat) {
     constexpr std::uint32_t zExportEnable = 0x1u;
     constexpr std::uint32_t stencilTestValExportEnable = 0x2u;
+    constexpr std::uint32_t stencilOpValExportEnable = 0x4u;
     constexpr std::uint32_t maskExportEnable = 0x100u;
     auto mask = ShaderControlMask;
     if (zFormat != 0u && zFormatSupported(zFormat)) mask &= ~zExportEnable;
-    if (zFormat == 2u || zFormat == 9u) mask &= ~stencilTestValExportEnable;
+    if (zFormat == 2u || zFormat == 9u) mask &= ~(stencilTestValExportEnable | stencilOpValExportEnable);
     if (zFormat == 9u) mask &= ~maskExportEnable;
     return mask;
 }
@@ -234,7 +242,7 @@ bool depthPlanesAbsent(const Registers& cx) {
     return z != cx.end() && stencil != cx.end() && (z->second & 3u) == 0 && (stencil->second & 1u) == 0;
 }
 
-VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint32_t refMask, bool readOnly, bool testValExport) {
+VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint32_t refMask, bool readOnly, bool testValExport, bool opValExport, bool opValReference) {
     VkStencilOpState face{};
     face.compareOp = static_cast<VkCompareOp>(compare);
     face.compareMask = (refMask >> 8u) & 0xffu;
@@ -245,7 +253,11 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     auto fixed = compare == 0 || compare == 7 ? 0u : face.compareMask;
     const auto convert = [&](std::uint32_t op) {
         if (face.writeMask == 0) return VK_STENCIL_OP_KEEP;
-        char detail[96];
+        char detail[112];
+        if (opValExport && ((op == 4 && !opValReference) || op == 5 || op == 6 || op == 8 || op == 9)) {
+            std::snprintf(detail, sizeof(detail), "AGC graphics: stencil operation %u with a pixel shader that exports the stencil operation value is unsupported", op);
+            throw std::runtime_error(detail);
+        }
         switch (op) {
             case 0: return VK_STENCIL_OP_KEEP;
             case 1: return VK_STENCIL_OP_ZERO;
@@ -254,6 +266,10 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
             case 4: {
                 if (testValExport) {
                     if (op != 3) throw std::runtime_error("AGC graphics: stencil replacement by a value other than the test value is unsupported with a pixel shader that exports the stencil test value");
+                    return VK_STENCIL_OP_REPLACE;
+                }
+                if (opValReference) {
+                    if (op != 4) throw std::runtime_error("AGC graphics: stencil replacement by a value other than the operation value is unsupported with a pixel shader that exports the stencil operation value");
                     return VK_STENCIL_OP_REPLACE;
                 }
                 const auto value = op == 2 ? 0xffu : op == 3 ? test : opValue;
@@ -284,10 +300,12 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     face.passOp = convert((ops >> 4u) & 0xfu);
     face.depthFailOp = convert((ops >> 8u) & 0xfu);
     face.reference = reference;
+    Require(!opValReference || compare == 0 || compare == 7 || face.compareMask == 0, "a stencil compare against the test value is unsupported with a pixel shader that exports the stencil operation value");
     return face;
 }
 
-void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValExport, State& result) {
+void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValExport, bool opValExport, State& result) {
+    const bool opValReference = opValExport && StencilOperationValueReplaces(cx);
     zero(cx, 0x000, 0x0000101cu, "depth copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     const bool depthClear = (read(cx, 0x000) & 1u) != 0;
     const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
@@ -317,7 +335,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     depth.lastSlice = (view >> 13u) & 0x7ffu;
     depth.address = zFormat != 0 ? base(0x012, 0x01a) : 0;
     depth.stencilAddress = stencil ? base(0x013, 0x01b) : 0;
-    Require(zFormat == 0 || depthReadOnly || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
+    const bool depthWritten = zFormat != 0 && !depthReadOnly && (depthClear || (depthControl & 6u) == 6u || (read(cx, 0x000) & 0x60u) != 0);
+    Require(!depthWritten || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
     if (depth.samples != 1u) {
         depth.pipeBankXor = static_cast<std::uint32_t>(depth.address & 65535u);
@@ -349,8 +368,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     result.depthBoundsTest = (depthControl & 8u) != 0;
     if (result.depthBoundsTest) {
         Require(zFormat != 0, "depth bounds without a depth plane");
-        result.minDepthBounds = readFloat(cx, 0x008);
-        result.maxDepthBounds = readFloat(cx, 0x009);
+        result.minDepthBounds = readDepthBound(cx, 0x008);
+        result.maxDepthBounds = readDepthBound(cx, 0x009);
     }
     if (depthClear) {
         result.depthTest = true;
@@ -373,8 +392,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
         result.stencilBack = clear;
     } else if (result.stencilTest) {
         const auto ops = read(cx, 0x10b);
-        result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly, testValExport);
-        result.stencilBack = (depthControl & 0x80u) != 0 ? stencilFace((depthControl >> 20u) & 7u, ops >> 12u, read(cx, 0x10d), stencilReadOnly, testValExport) : result.stencilFront;
+        result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly, testValExport, opValExport, opValReference);
+        result.stencilBack = (depthControl & 0x80u) != 0 ? stencilFace((depthControl >> 20u) & 7u, ops >> 12u, read(cx, 0x10d), stencilReadOnly, testValExport, opValExport, opValReference) : result.stencilFront;
     }
 }
 
@@ -1159,7 +1178,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         const bool clear = renderControl != cx.end() && (renderControl->second & 3u) != 0;
         const auto tests = planeTests(cx, depthControl);
         if ((clear || tests != 0) && depthSurfaceBound(cx)) {
-            decodeDepth(cx, depthControl, (read(cx, 0x203) & 2u) != 0 && !PixelProgramSkipped(queue), result);
+            decodeDepth(cx, depthControl, (read(cx, 0x203) & 2u) != 0 && !PixelProgramSkipped(queue), (read(cx, 0x203) & 4u) != 0 && !PixelProgramSkipped(queue), result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 0xbu) != 0 && (tests == 0 || depthPlanesAbsent(cx)))) {
             static bool reported = false;
             if (!reported) {
@@ -1325,9 +1344,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     } else {
         const auto screenBottomRight = read(cx, 0xd);
         APS5_LOG_OUT_DEBUG("No color target, screen BR register=0x%x", screenBottomRight);
-        result.renderExtent = {screenBottomRight & 0xffffu, screenBottomRight >> 16u};
+        result.renderExtent = {std::max(screenBottomRight & 0xffffu, 1u), std::max(screenBottomRight >> 16u, 1u)};
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
-        Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
     result.quadSampleMask = decodeQuadSampleMask(cx, result.samples);
     result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
@@ -1647,7 +1665,13 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
     }
     if (!volume && lastSlice != slice) {
         const auto exports = find(cx, 0x207);
-        Require(exports == cx.end() || (exports->second & (1u << 18u)) == 0, "layered draws into a color view of several array slices are unsupported");
+        if (exports != cx.end() && (exports->second & (1u << 18u)) != 0) {
+            if (color.arrayLastSlice == 0) {
+                color.arrayLastSlice = lastSlice;
+                color.arraySlice = slice;
+            }
+            color.layers = lastSlice + 1u - slice;
+        }
     }
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
@@ -1955,7 +1979,9 @@ std::string NullPixelProgramRejection(const QueueState& queue) {
     const auto targetMask = find(queue.context, 0x8e);
     const auto shaderMask = find(queue.context, 0x8f);
     if (targetMask == queue.context.end() || shaderMask == queue.context.end()) return "AGC graphics: a draw without a pixel program needs CB_TARGET_MASK and CB_SHADER_MASK";
-    if (ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
+    const auto colorControl = find(queue.context, 0x202);
+    const bool colorDisabled = colorControl != queue.context.end() && ((colorControl->second >> 4u) & 7u) == 0u;
+    if (!colorDisabled && ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
     return {};
 }
 
@@ -1976,6 +2002,22 @@ bool SplitsAlternateAlpha(const State& state) {
         if (blend.srcColorBlendFactor != blend.srcAlphaBlendFactor || blend.dstColorBlendFactor != blend.dstAlphaBlendFactor || blend.colorBlendOp != blend.alphaBlendOp) return true;
     }
     return false;
+}
+
+bool StencilOperationValueReplaces(const Registers& context) {
+    const auto value = [&](std::uint32_t offset) {
+        const auto found = find(context, offset);
+        return found == context.end() ? 0u : found->second;
+    };
+    if ((value(0x203) & 6u) != 4u) return false;
+    const auto depthControl = value(0x200);
+    if ((depthControl & 1u) == 0 || (value(0x011) & 1u) == 0 || (value(0x002) & 0x02000000u) != 0 || (value(0x000) & 2u) != 0) return false;
+    const auto replaces = [](std::uint32_t ops, std::uint32_t refMask) {
+        if (((refMask >> 16u) & 0xffu) == 0) return false;
+        return (ops & 0xfu) == 4u || ((ops >> 4u) & 0xfu) == 4u || ((ops >> 8u) & 0xfu) == 4u;
+    };
+    const auto ops = value(0x10b);
+    return replaces(ops, value(0x10c)) || ((depthControl & 0x80u) != 0 && replaces(ops >> 12u, value(0x10d)));
 }
 
 bool StencilReferenceUnused(const State& state) {

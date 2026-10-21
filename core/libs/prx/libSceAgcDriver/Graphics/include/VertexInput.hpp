@@ -376,36 +376,36 @@ inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indice
     return highest;
 }
 
-template <typename Index>
-Index HighestIndexValue(const std::byte* bytes, std::size_t count) {
-    Index highest = 0;
-    for (std::size_t i = 0; i < count; ++i) {
-        Index value;
-        std::memcpy(&value, bytes + i * sizeof(Index), sizeof(Index));
-        highest = std::max(highest, value);
+template <typename TIndex>
+std::optional<std::uint32_t> HighestDrawIndexOf(std::span<const std::byte> indices, bool skipRestart) {
+    constexpr auto restartIndex = std::numeric_limits<TIndex>::max();
+    const auto count = indices.size() / sizeof(TIndex);
+    const auto* data = indices.data();
+    TIndex highest = 0;
+    if (!skipRestart) {
+        for (std::size_t i = 0; i < count; ++i) {
+            TIndex index;
+            std::memcpy(&index, data + i * sizeof(TIndex), sizeof(TIndex));
+            highest = std::max(highest, index);
+        }
+        if (count == 0) return std::nullopt;
+        return highest;
     }
+    TIndex kept = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        TIndex index;
+        std::memcpy(&index, data + i * sizeof(TIndex), sizeof(TIndex));
+        const TIndex valid = index == restartIndex ? TIndex{0} : TIndex(~TIndex{0});
+        highest = std::max(highest, static_cast<TIndex>(index & valid));
+        kept |= valid;
+    }
+    if (kept == 0) return std::nullopt;
     return highest;
-}
-
-template <typename Index>
-std::optional<std::uint32_t> HighestIndexOf(std::span<const std::byte> indices, bool skipRestart) {
-    const std::size_t count = indices.size() / sizeof(Index);
-    if (count == 0) return std::nullopt;
-    const auto highest = HighestIndexValue<Index>(indices.data(), count);
-    constexpr Index restartIndex = std::numeric_limits<Index>::max();
-    if (!skipRestart || highest != restartIndex) return highest;
-    std::optional<std::uint32_t> below;
-    for (std::size_t i = 0; i < count; ++i) {
-        Index value;
-        std::memcpy(&value, indices.data() + i * sizeof(Index), sizeof(Index));
-        if (value != restartIndex) below = std::max<std::uint32_t>(below.value_or(0u), value);
-    }
-    return below;
 }
 
 inline std::optional<std::uint32_t> HighestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
-    return indexSize == 2 ? HighestIndexOf<std::uint16_t>(indices, skipRestart) : HighestIndexOf<std::uint32_t>(indices, skipRestart);
+    return indexSize == 2 ? HighestDrawIndexOf<std::uint16_t>(indices, skipRestart) : HighestDrawIndexOf<std::uint32_t>(indices, skipRestart);
 }
 
 inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> indices, std::uint32_t indexSize) {

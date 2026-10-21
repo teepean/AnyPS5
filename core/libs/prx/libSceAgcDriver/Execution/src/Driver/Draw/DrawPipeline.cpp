@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,10 @@ std::atomic<unsigned> runningCommitters{0};
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
+
+std::atomic<std::uint64_t> heldReadRanges{0};
+std::atomic<std::uint64_t> heldReadQueries{0};
+std::atomic<std::uint64_t> heldReadHits{0};
 
 }
 
@@ -73,7 +78,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Item> dead;
     std::unique_lock lock(mutex);
@@ -95,7 +100,8 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
+    heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -163,7 +169,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps and %llu labels attached to queued items; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), drainText.c_str());
+    char reads[64];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
+    drainText += reads;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps and %llu labels attached to queued items;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = attachedLabels = 0;
     drains = {};
     drainWaitNs = {};
@@ -172,6 +181,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PerformanceTrace::BindThread("draw committer");
+    StartCommitterSampler();
     bool taken = false;
     Commit* commit = nullptr;
     for (;;) {
@@ -266,6 +276,27 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
+}
+
+bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    const auto end = address + bytes;
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    heldReadQueries.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& item : pipeline.items) {
+        for (const auto& [begin, limit] : item.reads) {
+            if (address >= limit || begin >= end) continue;
+            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void DrawPipeline::ReleaseRunningReads() {
+    std::lock_guard lock(mutex);
+    if (!items.empty()) items.front().reads.clear();
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

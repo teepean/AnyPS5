@@ -3,6 +3,8 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
@@ -33,6 +35,7 @@ int APS5_VABI sceKernelFchmod(int, unsigned short);
 int APS5_VABI fchmod_nid_postfix(int, int);
 int APS5_VABI chmod_nid_postfix(const char*, int);
 int APS5_VABI chflags_nid_postfix(const char*, std::uint64_t);
+int APS5_VABI fchflags_nid_postfix(int, std::uint64_t);
 int APS5_VABI futimes_nid_postfix(int, const KernelTimeval*);
 int APS5_VABI sceKernelFutimes(int, const KernelTimeval*);
 int APS5_VABI socket_nid_postfix(int, int, int);
@@ -43,6 +46,7 @@ int APS5_VABI sceKernelFdatasync(int);
 int APS5_VABI sceKernelWriteThrottlingStatus(std::uint64_t*);
 int APS5_VABI sceKernelFtruncate(int, long long);
 int APS5_VABI sceKernelTruncate_nid_postfix(const char*, long long);
+int APS5_VABI truncate_nid_postfix(const char*, long long);
 int APS5_VABI sceKernelUtimes_nid_postfix(const char*, const void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
 int APS5_VABI creat_nid_postfix(const char*, int);
@@ -96,6 +100,10 @@ std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const void*, std::size_t);
 int APS5_VABI sceKernelDebugOutText(int, const char*);
 }
+#ifdef _WIN32
+static bool g_invalidParameter = false;
+static void RecordInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, std::uintptr_t) { g_invalidParameter = true; }
+#endif
 static void Check(bool value, int line) {
     if (!value) {
 #ifdef _WIN32
@@ -119,6 +127,15 @@ static void Check(bool value, int line) {
 static bool ChflagsThrows(const std::filesystem::path& path, std::uint64_t flags, const char* names) {
     try {
         chflags_nid_postfix(path.string().c_str(), flags);
+    } catch (const std::runtime_error& error) {
+        return std::strstr(error.what(), names) != nullptr;
+    }
+    return false;
+}
+
+static bool FchflagsThrows(int descriptor, std::uint64_t flags, const char* names) {
+    try {
+        fchflags_nid_postfix(descriptor, flags);
     } catch (const std::runtime_error& error) {
         return std::strstr(error.what(), names) != nullptr;
     }
@@ -305,6 +322,42 @@ static void TestRelinkedModuleNameCase() {
 }
 
 #ifdef _WIN32
+static void TestCaseSensitiveHostDirectory() {
+    const auto root = std::filesystem::temp_directory_path() / ("anyps5-sensitive-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directory(root));
+    const auto handle = CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    Require(handle != INVALID_HANDLE_VALUE);
+    struct { ULONG flags; } information{FILE_CS_FLAG_CASE_SENSITIVE_DIR};
+    constexpr auto caseSensitiveInfo = static_cast<FILE_INFO_BY_HANDLE_CLASS>(23);
+    const bool enabled = SetFileInformationByHandle(handle, caseSensitiveInfo, &information, sizeof(information));
+    const auto error = GetLastError();
+    CloseHandle(handle);
+    if (!enabled && (error == ERROR_NOT_SUPPORTED || error == ERROR_INVALID_PARAMETER || error == ERROR_ACCESS_DENIED)) {
+        std::printf("case-sensitive host directory unavailable: %lu\n", error);
+        std::filesystem::remove(root);
+        return;
+    }
+    Require(enabled);
+    { std::ofstream file(root / "File.txt"); file << "payload"; }
+    Require(std::filesystem::create_directory(root / "Sub"));
+    Require(std::filesystem::create_directory(root / "Both"));
+    Require(std::filesystem::create_directory(root / "both"));
+    { std::ofstream file(root / "libCase.prx.guest.prx"); file << "module"; }
+    const auto host = root.string();
+    AddPathAlias_nid_no_patch("/sensitive-host", host.c_str());
+    Require(ResolvePath_nid_no_patch("/sensitive-host/file.txt") == root / "File.txt");
+    Require(ResolvePath_nid_no_patch("/sensitive-host/sub") == root / "Sub");
+    Require(ResolvePathOrRelinkedModule_nid_no_patch("/sensitive-host/libcase.prx") == root / "libCase.prx.guest.prx");
+    bool ambiguous = false;
+    try { ResolvePath_nid_no_patch("/sensitive-host/BOTH/file.txt"); }
+    catch (const std::runtime_error& failure) { ambiguous = std::strstr(failure.what(), "Ambiguous case-insensitive guest path") != nullptr; }
+    Require(ambiguous);
+    RemovePathAlias_nid_no_patch("/sensitive-host");
+    std::filesystem::remove_all(root);
+}
+
 static std::filesystem::path ExtendedPath(const std::filesystem::path& path) {
     const auto& native = path.native();
     if (native.starts_with(L"\\\\?\\") || native.starts_with(L"\\\\.\\")) return path;
@@ -395,6 +448,7 @@ int main() {
     TestRelinkedModuleNames();
     TestRelinkedModuleNameCase();
 #ifdef _WIN32
+    TestCaseSensitiveHostDirectory();
     TestLongHostPathStat();
 #endif
 #ifdef __linux__
@@ -537,6 +591,9 @@ int main() {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(mkdir_nid_postfix(root.string().c_str(), 0700) == 0);
     Require(mkdir_nid_postfix(root.string().c_str(), 0700) == -1 && *__error_nid_postfix() == 17);
+    for (const char* openMode : {"w", "wb", "r+", "a"}) {
+        Require(fopen_nid_postfix(root.string().c_str(), openMode) == nullptr && *__error_nid_postfix() == 21);
+    }
     Require(mkdir_nid_postfix((root / "missing" / "child").string().c_str(), 0700) == -1 && *__error_nid_postfix() == 2);
     Require(mkdir_nid_postfix(nullptr, 0700) == -1 && *__error_nid_postfix() == 14);
     const auto file = root / "file.txt";
@@ -555,6 +612,28 @@ int main() {
     Require(chflags_nid_postfix(file.string().c_str(), 0x200000) == -1 && *__error_nid_postfix() == 1);
     Require(ChflagsThrows(file, 0x2, "UF_IMMUTABLE"));
     Require(ChflagsThrows(file, 0x1000 | 0x40000, "UF_READONLY|SF_APPEND"));
+    const int flagged = open_nid_postfix(file.string().c_str(), 0, 0);
+    Require(flagged >= 0 && fchflags_nid_postfix(flagged, 0) == 0);
+    Require(fchflags_nid_postfix(flagged, 0x20) == -1 && *__error_nid_postfix() == 45);
+    Require(fchflags_nid_postfix(flagged, 1ULL << 32) == -1 && *__error_nid_postfix() == 45);
+    Require(fchflags_nid_postfix(flagged, ~0ULL) == -1 && *__error_nid_postfix() == 45);
+    Require(fchflags_nid_postfix(flagged, 0x200000) == -1 && *__error_nid_postfix() == 1);
+    Require(FchflagsThrows(flagged, 0x2, "UF_IMMUTABLE"));
+    Require(FchflagsThrows(flagged, 0x1000 | 0x40000, "UF_READONLY|SF_APPEND"));
+    Require(close_nid_postfix(flagged) == 0);
+    Require(fchflags_nid_postfix(flagged, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(fchflags_nid_postfix(flagged, ~0ULL) == -1 && *__error_nid_postfix() == 9);
+    Require(fchflags_nid_postfix(-1, 0) == -1 && *__error_nid_postfix() == 9);
+    const int flaggedRoot = sceKernelOpen(root.string().c_str(), 0x20000, 0);
+    Require(flaggedRoot >= 0 && fchflags_nid_postfix(flaggedRoot, 0) == 0 && sceKernelClose(flaggedRoot) == 0);
+    int flaggedPipe[2];
+    Require(pipe_nid_postfix(flaggedPipe) == 0);
+    Require(fchflags_nid_postfix(flaggedPipe[0], 0) == -1 && *__error_nid_postfix() == 22);
+    Require(fchflags_nid_postfix(flaggedPipe[1], ~0ULL) == -1 && *__error_nid_postfix() == 22);
+    Require(close_nid_postfix(flaggedPipe[0]) == 0 && close_nid_postfix(flaggedPipe[1]) == 0);
+    const int flaggedSocket = socket_nid_postfix(2, 2, 0);
+    Require(flaggedSocket >= 0 && fchflags_nid_postfix(flaggedSocket, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(close_nid_postfix(flaggedSocket) == 0);
     const auto held = root / "held.txt";
     const auto heldName = held.string();
     { std::ofstream stream(held); stream << "held"; }
@@ -726,7 +805,7 @@ int main() {
     Require(std::filesystem::file_size(sized) == 6);
     { std::ifstream stream(sized); std::string contents; std::getline(stream, contents);
       Require(contents == "012345"); }
-    Require(sceKernelTruncate_nid_postfix((sized / "missing").string().c_str(), 6) == static_cast<int>(0x80020002u));
+    Require(sceKernelTruncate_nid_postfix((sized / "missing").string().c_str(), 6) == static_cast<int>(0x80020014u));
     Require(sceKernelUtimes_nid_postfix(sized.string().c_str(), nullptr) == 0);
     std::FILE* native = std::fopen(sized.string().c_str(), "r+b");
     Require(native != nullptr);
@@ -774,6 +853,14 @@ int main() {
     Require(sceKernelFdatasync(socket) == static_cast<int>(0x80020016u));
     Require(fsync_nid_postfix(socket) == -1 && *__error_nid_postfix() == 22);
     Require(sceKernelFsync(socket) == static_cast<int>(0x80020016u));
+    int syncPipe[2] = {-1, -1};
+    Require(pipe_nid_postfix(syncPipe) == 0);
+    for (const int end : syncPipe) {
+        Require(fsync_nid_postfix(end) == -1 && *__error_nid_postfix() == 22);
+        Require(fdatasync_nid_postfix(end) == -1 && *__error_nid_postfix() == 22);
+        Require(sceKernelFsync(end) == static_cast<int>(0x80020016u) && sceKernelFdatasync(end) == static_cast<int>(0x80020016u));
+    }
+    Require(close_nid_postfix(syncPipe[0]) == 0 && close_nid_postfix(syncPipe[1]) == 0);
     Require(close_nid_postfix(socket) == 0);
     Require(fchmod_nid_postfix(socket, 0600) == -1 && *__error_nid_postfix() == 9);
     Require(futimes_nid_postfix(socket, nullptr) == -1 && *__error_nid_postfix() == 9);
@@ -783,6 +870,17 @@ int main() {
     Require(sceKernelFsync(socket) == static_cast<int>(0x80020009u));
     Require(sceKernelFdatasync(0x7fffffff) == static_cast<int>(0x80020009u));
     Require(sceKernelFsync(0x7fffffff) == static_cast<int>(0x80020009u));
+#ifdef _WIN32
+    const auto previousParameterHandler = _set_invalid_parameter_handler(RecordInvalidParameter);
+#endif
+    FileStat closedStatus{};
+    Require(sceKernelFstat(descriptor, &closedStatus) == static_cast<int>(0x80020009u));
+    Require(sceKernelFstat(socket, &closedStatus) == static_cast<int>(0x80020009u));
+    Require(sceKernelFstat(0x7fffffff, &closedStatus) == static_cast<int>(0x80020009u));
+#ifdef _WIN32
+    _set_invalid_parameter_handler(previousParameterHandler);
+    Require(!g_invalidParameter);
+#endif
     Require(remove_nid_postfix(sized.string().c_str()) == 0);
     const auto present = root / "present.txt";
     const auto presentName = present.string();
@@ -795,11 +893,24 @@ int main() {
     Require(sceKernelCheckReachability("") == static_cast<int>(0x80020002u));
     Require(sceKernelRename("", presentName.c_str()) == static_cast<int>(0x80020002u));
     Require(sceKernelRename(presentName.c_str(), "") == static_cast<int>(0x80020002u));
+    Require(sceKernelRename(missingName.c_str(), nullptr) == static_cast<int>(0x80020002u));
+    Require(sceKernelRename("", nullptr) == static_cast<int>(0x80020002u));
+    Require(sceKernelRename(".", nullptr) == static_cast<int>(0x80020016u));
+    Require(sceKernelRename(missingName.c_str(), ".") == static_cast<int>(0x80020002u));
+    Require(sceKernelRename(presentName.c_str(), nullptr) == static_cast<int>(0x8002000Eu));
+    Require(sceKernelRename(nullptr, presentName.c_str()) == static_cast<int>(0x8002000Eu));
+    Require(rename_nid_postfix(missingName.c_str(), nullptr) == -1 && *__error_nid_postfix() == 2);
+    Require(rename_nid_postfix(presentName.c_str(), nullptr) == -1 && *__error_nid_postfix() == 14);
     Require(sceKernelRmdir("") == static_cast<int>(0x80020002u));
     Require(sceKernelMkdir("", 0700) == static_cast<int>(0x80020002u));
     const auto cwdPermissions = std::filesystem::status(".").permissions();
     Require(sceKernelChmod_nid_postfix("", static_cast<unsigned short>(cwdPermissions) & 07777) == static_cast<int>(0x80020002u));
     Require(sceKernelTruncate_nid_postfix("", 0) == static_cast<int>(0x80020002u));
+    Require(sceKernelTruncate_nid_postfix(nullptr, -1) == static_cast<int>(0x80020016u));
+    Require(sceKernelTruncate_nid_postfix("", -1) == static_cast<int>(0x80020016u));
+    Require(truncate_nid_postfix(nullptr, -1) == -1 && *__error_nid_postfix() == 22);
+    Require(truncate_nid_postfix("", -1) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelTruncate_nid_postfix(nullptr, 0) == static_cast<int>(0x8002000Eu));
     const auto cwdWriteTime = std::filesystem::last_write_time(".");
     const int emptyUtimes = sceKernelUtimes_nid_postfix("", nullptr);
     std::error_code restoreTimeError;
@@ -835,6 +946,11 @@ int main() {
     Require(stat_nid_postfix(link.string().c_str(), &status) == 0 && (status.st_mode & 0170000) == 0100000 && status.st_size == 5);
     const auto dangling = root / "dangling";
     std::filesystem::create_symlink("missing.txt", dangling);
+    const auto statLoop = root / "stat-loop";
+    std::filesystem::create_symlink("stat-loop", statLoop);
+    errno = 0;
+    Require(!File::TryFillFileStat(statLoop, &status) && errno == ELOOP);
+    Require(sceKernelStat(statLoop.generic_string().c_str(), &status) == SCE_KERNEL_ERROR_ELOOP);
     Require(lstat_nid_postfix(dangling.string().c_str(), &linkStatus) == 0 && (linkStatus.st_mode & 0170000) == 0120000);
     constexpr int noFollow = 0x100;
     Require(sceKernelOpen(link.string().c_str(), noFollow, 0) == static_cast<int>(0x8002001Fu));
@@ -854,7 +970,8 @@ int main() {
     Require(unlink_nid_postfix(viaMissing.c_str()) == -1 && *__error_nid_postfix() == 2 && std::filesystem::exists(present));
     Require(stat_nid_postfix((presentName + "/..").c_str(), &status) == -1 && *__error_nid_postfix() == 20);
     Require(sceKernelStat((presentName + "/../present.txt").c_str(), &status) == static_cast<int>(0x80020014u));
-    Require(unlink_nid_postfix(link.string().c_str()) == 0 && unlink_nid_postfix(dangling.string().c_str()) == 0);
+    Require(unlink_nid_postfix(link.string().c_str()) == 0 && unlink_nid_postfix(dangling.string().c_str()) == 0 &&
+        unlink_nid_postfix(statLoop.string().c_str()) == 0);
 #else
     const auto fileLink = root / "file-link";
     if (CreateSymbolicLinkW(fileLink.c_str(), L"present.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == 0) {
@@ -871,6 +988,12 @@ int main() {
         Require(CreateSymbolicLinkW(danglingLink.c_str(), L"missing.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
         Require(CreateSymbolicLinkW(absoluteLink.c_str(), std::filesystem::absolute(present).c_str(),
             SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        const auto statLoop = root / "stat-loop";
+        Require(CreateSymbolicLinkW(statLoop.c_str(), L"stat-loop", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        Require(sceKernelStat(statLoop.generic_string().c_str(), &status) == static_cast<int>(0x8002003eu));
+        Require(sceKernelOpen(statLoop.generic_string().c_str(), 0, 0) == static_cast<int>(0x8002003eu));
+        Require(open_nid_postfix(statLoop.string().c_str(), 0, 0) == -1 && *__error_nid_postfix() == 62);
+        Require(fopen_nid_postfix(statLoop.string().c_str(), "r") == nullptr && *__error_nid_postfix() == 62);
         const auto checkRelativeLink = [](const std::filesystem::path& link, std::int64_t targetLength) {
             FileStat own{};
             return lstat_nid_postfix(link.string().c_str(), &own) == 0 && (own.st_mode & 0170000) == 0120000 &&
@@ -890,6 +1013,7 @@ int main() {
         Require((absoluteStatus.st_mode & 0170000) == 0120000 && absoluteStatus.st_size > 0 && absoluteStatus.st_nlink == 1);
         Require(stat_nid_postfix(absoluteLink.string().c_str(), &followed) == 0 && followed.st_ino == status.st_ino);
         Require(std::filesystem::remove(fileLink) && std::filesystem::remove(directoryLink) && DeleteFileW(danglingLink.c_str()) != 0 &&
+            DeleteFileW(statLoop.c_str()) != 0 &&
             std::filesystem::remove(absoluteLink) && std::filesystem::remove(targetDirectory));
     }
     const auto junctionTarget = root / "junction-target";
@@ -902,6 +1026,11 @@ int main() {
     Require((junctionStatus.st_mode & 0170000) == 0120000 && junctionStatus.st_size > 0);
     FileStat junctionFollowed{};
     Require(stat_nid_postfix(junction.string().c_str(), &junctionFollowed) == 0 && (junctionFollowed.st_mode & 0170000) == 0040000);
+    constexpr int noFollow = 0x100;
+    Require(sceKernelOpen(junction.string().c_str(), noFollow, 0) == static_cast<int>(0x8002001Fu));
+    Require(open_nid_postfix(junction.string().c_str(), noFollow, 0) == -1 && *__error_nid_postfix() == 31);
+    const int followedJunction = sceKernelOpen(junction.string().c_str(), 0, 0);
+    Require(followedJunction >= 0 && sceKernelClose(followedJunction) == 0);
     Require(std::filesystem::remove(junction) && std::filesystem::remove(junctionTarget));
 #endif
     FileStat identity{};
@@ -945,6 +1074,16 @@ int main() {
     Require(flock_nid_postfix(other, 2 | 4) == 0);
     Require(flock_nid_postfix(other, 8) == 0);
     Require(flock_nid_postfix(locked, 2 | 4) == 0);
+    Require(lseek_nid_postfix(-1, 0, 7) == -1 && *__error_nid_postfix() == 9);
+    Require(lseek_nid_postfix(0x7fffffff, 0, -1) == -1 && *__error_nid_postfix() == 9);
+    Require(lseek_nid_postfix(locked, 0, 7) == -1 && *__error_nid_postfix() == 22);
+    Require(flock_nid_postfix(-1, 2 | 4) == -1 && *__error_nid_postfix() == 9);
+    Require(flock_nid_postfix(0x7fffffff, 1) == -1 && *__error_nid_postfix() == 9);
+    int flockPipe[2] = {-1, -1};
+    Require(pipe_nid_postfix(flockPipe) == 0);
+    Require(flock_nid_postfix(flockPipe[0], 2 | 4) == -1 && *__error_nid_postfix() == 45);
+    Require(flock_nid_postfix(flockPipe[1], 8) == -1 && *__error_nid_postfix() == 45);
+    Require(close_nid_postfix(flockPipe[0]) == 0 && close_nid_postfix(flockPipe[1]) == 0);
     Require(close_nid_postfix(locked) == 0);
     const int recycled = open_nid_postfix(presentName.c_str(), 0, 0);
     Require(recycled >= 0 && flock_nid_postfix(recycled, 8) == 0);
@@ -1026,6 +1165,19 @@ int main() {
     Require(sceKernelOpen(presentName.c_str(), 0x20402, 0) == static_cast<int>(0x80020014u));
     Require(std::filesystem::file_size(present) == 5);
     Require(sceKernelOpen(missingName.c_str(), 0x20000, 0) == static_cast<int>(0x80020002u));
+    const auto invalidFlagsName = (root / "invalid-flags.txt").string();
+    Require(sceKernelOpen(presentName.c_str(), 3, 0) == static_cast<int>(0x80020016u));
+    Require(sceKernelOpen(missingName.c_str(), 0x203, 0600) == static_cast<int>(0x80020016u));
+    Require(open_nid_postfix(presentName.c_str(), 3, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix(presentName.c_str(), 0x403) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelOpen(invalidFlagsName.c_str(), 0x20a02, 0600) == static_cast<int>(0x80020016u));
+    Require(open_nid_postfix(invalidFlagsName.c_str(), 0x20a00, 0600) == -1 && *__error_nid_postfix() == 22);
+    Require(!std::filesystem::exists(invalidFlagsName));
+    Require(open_nid_postfix(nullptr, 3, 0) == -1 && *__error_nid_postfix() == 22);
+    Require(open_nid_postfix("", 0x20a00, 0600) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix(nullptr, 0x403) == -1 && *__error_nid_postfix() == 22);
+    Require(_open_nid_postfix("", 3) == -1 && *__error_nid_postfix() == 22);
+    Require(std::filesystem::file_size(present) == 5);
     Require(open_nid_postfix("", 0, 0) == -1 && *__error_nid_postfix() == 2);
     Require(_open_nid_postfix("", 0) == -1 && *__error_nid_postfix() == 2);
     Require(sceKernelOpen("", 0, 0) == static_cast<int>(0x80020002u));
@@ -1081,6 +1233,28 @@ int main() {
     Require(rmdir_nid_postfix((missingName + "/").c_str()) == -1 && *__error_nid_postfix() == 2);
     Require(sceKernelRmdir((presentName + "/").c_str()) == static_cast<int>(0x80020014u));
     Require(sceKernelRmdir((missingName + "/").c_str()) == static_cast<int>(0x80020002u));
+    const auto missingChild = missingName + "/child";
+    for (const auto* blocked : {&underFile, &deepUnderFile, &missingChild}) {
+        const int expected = blocked == &missingChild ? 2 : 20;
+        FileStat blockedStatus{};
+        Require(open_nid_postfix(blocked->c_str(), 0, 0) == -1 && *__error_nid_postfix() == expected);
+        Require(open_nid_postfix(blocked->c_str(), 0x202, 0644) == -1 && *__error_nid_postfix() == expected);
+        Require(stat_nid_postfix(blocked->c_str(), &blockedStatus) == -1 && *__error_nid_postfix() == expected);
+        Require(lstat_nid_postfix(blocked->c_str(), &blockedStatus) == -1 && *__error_nid_postfix() == expected);
+        Require(access_nid_postfix(blocked->c_str(), 0) == -1 && *__error_nid_postfix() == expected);
+        Require(unlink_nid_postfix(blocked->c_str()) == -1 && *__error_nid_postfix() == expected);
+        Require(chmod_nid_postfix(blocked->c_str(), 0644) == -1 && *__error_nid_postfix() == expected);
+        Require(sceKernelTruncate_nid_postfix(blocked->c_str(), 0) == static_cast<int>(0x80020000u | static_cast<unsigned>(expected)));
+        Require(sceKernelUtimes_nid_postfix(blocked->c_str(), nullptr) == static_cast<int>(0x80020000u | static_cast<unsigned>(expected)));
+        Require(rename_nid_postfix(blocked->c_str(), (root / "renamed-target").string().c_str()) == -1 && *__error_nid_postfix() == expected);
+        if (blocked != &missingChild) Require(rename_nid_postfix(presentName.c_str(), blocked->c_str()) == -1 && *__error_nid_postfix() == expected);
+        Require(remove_nid_postfix(blocked->c_str()) == -1 && *__error_nid_postfix() == expected);
+        Require(opendir_nid_postfix(blocked->c_str()) == nullptr && *__error_nid_postfix() == expected);
+        Require(chdir_nid_postfix(blocked->c_str()) == -1 && *__error_nid_postfix() == expected);
+        for (const char* openMode : {"r", "w"}) {
+            Require(fopen_nid_postfix(blocked->c_str(), openMode) == nullptr && *__error_nid_postfix() == expected);
+        }
+    }
 #ifndef _WIN32
     const auto linkedDirectory = root / "linked-directory";
     const auto directoryLink = root / "directory-link";
