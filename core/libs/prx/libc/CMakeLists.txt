@@ -45,6 +45,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/x86_64/CallTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/JemallocPreload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AllocatingStrings.cpp
@@ -881,6 +882,13 @@ if(BUILD_TESTING)
         add_test_executable(cpu_topology_tests ${LIBS_INCLUDE_DIR}/tests/CpuTopology.cpp)
         target_include_directories(cpu_topology_tests PRIVATE ${LIBS_INCLUDE_DIR})
         add_test(NAME cpu_topology COMMAND cpu_topology_tests)
+        add_test_executable(jemalloc_preload_tests ${LIBS_INCLUDE_DIR}/tests/JemallocPreload.cpp)
+        target_include_directories(jemalloc_preload_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(jemalloc_preload_tests PRIVATE libc)
+        add_test(NAME jemalloc_preload COMMAND jemalloc_preload_tests)
+        set_tests_properties(jemalloc_preload PROPERTIES ENVIRONMENT_MODIFICATION "APS5_JEMALLOC=unset:;LD_PRELOAD=unset:")
+        add_test(NAME jemalloc_preload_restart COMMAND jemalloc_preload_tests restarted)
+        set_tests_properties(jemalloc_preload_restart PROPERTIES ENVIRONMENT_MODIFICATION "APS5_JEMALLOC=set:1;LD_PRELOAD=unset:" SKIP_RETURN_CODE 77)
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32)
         add_test_executable(guest_backtrace_tests ${LIBS_INCLUDE_DIR}/tests/GuestBacktrace.cpp)
