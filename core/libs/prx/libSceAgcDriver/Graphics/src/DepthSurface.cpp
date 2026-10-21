@@ -711,8 +711,13 @@ public:
     bool SyncFromMemory(const GuestTextureResource& resource, std::uint64_t planeBytes) {
         const auto bytes = static_cast<std::size_t>(planeBytes);
         GuestMemory::CollectWrites(resource.baseAddress, bytes);
-        if (syncedGeneration == 0 || (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !GuestMemory::WrittenSince(resource.baseAddress, bytes, syncedGeneration)) {
+        if (syncedGeneration == 0 || (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
             syncedGeneration = GuestMemory::TrackerGeneration();
+            return false;
+        }
+        std::uint64_t current = 0;
+        if (!GuestMemory::WrittenSinceCurrent(resource.baseAddress, bytes, syncedGeneration, current)) {
+            syncedGeneration = current;
             return false;
         }
         memoryStale = false;

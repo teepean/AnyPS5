@@ -1923,6 +1923,15 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     return !tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
 }
 
+bool WrittenSinceCurrent(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t& current) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    current = tracker.generation;
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    return !tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
+}
+
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
