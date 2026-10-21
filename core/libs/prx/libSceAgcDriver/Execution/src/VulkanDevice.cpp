@@ -80,6 +80,8 @@
 namespace AgcDriver {
 namespace {
 
+thread_local Graphics::Context buildingContext;
+
 void check(VkResult result, const char* operation) {
     if (result == VK_ERROR_DEVICE_LOST) Graphics::ReportDeviceLost();
     if (result != VK_SUCCESS) {
@@ -997,6 +999,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : VulkanDevice(wind
 VulkanDevice::VulkanDevice(CompileOnly) : VulkanDevice(nullptr, true) {}
 
 VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
+    struct DropBuildingContext {
+        ~DropBuildingContext() { buildingContext = {}; }
+    } dropBuildingContext;
     state->compileOnly = compileOnly;
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
@@ -3712,9 +3717,8 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 const Graphics::Context& VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    thread_local Graphics::Context built;
-    built = buildContext();
-    return built;
+    buildingContext = buildContext();
+    return buildingContext;
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
