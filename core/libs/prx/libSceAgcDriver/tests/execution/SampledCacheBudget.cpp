@@ -606,9 +606,9 @@ bool lookupChangedTests(Context context) {
     Require(first->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Fast, "the lookup-changed template did not take the fast proof");
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     Require(first->Revalidate(shader, &report), "the audit refused an unchanged template");
-    Require(report.path == ShaderResources::ProofPath::Full, "a proof past the audit interval did not take the full walk");
     Require(first->SampledTextures().front() == bound, "the audit changed the bound texture");
-    Require(first->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Fast, "the proof right after an audit did not take the fast proof");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    Require(first->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Fast, "a proof past the audit interval took the full walk although no host import changed since the last one");
     if (HostImportFor(context, surface.Address(), SurfaceBytes) == nullptr) {
         Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the host import of the watched surface was refused");
         std::puts("skipped, host imports are unavailable");

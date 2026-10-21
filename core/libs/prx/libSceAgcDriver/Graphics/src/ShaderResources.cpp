@@ -2976,6 +2976,11 @@ std::chrono::steady_clock::duration TemplateAuditInterval() {
     return interval;
 }
 
+bool AuditEveryInterval() {
+    static const bool always = std::getenv("APS5_TEMPLATE_AUDIT_ALWAYS") != nullptr;
+    return always;
+}
+
 bool TemplateAuditDue(std::chrono::steady_clock::time_point last) {
     const auto interval = TemplateAuditInterval();
     return interval.count() != 0 && std::chrono::steady_clock::now() - last >= interval;
@@ -3654,6 +3659,7 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
         lastFullWalk = std::chrono::steady_clock::now();
+        walkImportGeneration = HostImportSetGeneration();
         lookupLog().clear();
         BuildLookups lookups;
         std::size_t textureIndex = 0;
@@ -3759,7 +3765,7 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
-    if (fast && TemplateAuditDue(lastFullWalk)) {
+    if (fast && TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || walkImportGeneration != HostImportSetGeneration())) {
         fast = false;
         ownRefreshed = false;
         reason = FastFail::Audit;
