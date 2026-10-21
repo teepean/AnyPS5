@@ -708,8 +708,8 @@ public:
         return mirrorPlane.storage;
     }
 
-    bool SyncFromMemory(const GuestTextureResource& resource) {
-        const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    bool SyncFromMemory(const GuestTextureResource& resource, std::uint64_t planeBytes) {
+        const auto bytes = static_cast<std::size_t>(planeBytes);
         GuestMemory::CollectWrites(resource.baseAddress, bytes);
         if (syncedGeneration == 0 || (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !GuestMemory::WrittenSince(resource.baseAddress, bytes, syncedGeneration)) {
             syncedGeneration = GuestMemory::TrackerGeneration();
@@ -732,6 +732,7 @@ public:
     }
 
     bool memoryStale = false;
+    mutable std::uint64_t planeBytes = 0;
     std::uint64_t scannedEpoch = 0;
     std::uint64_t syncedGeneration = 0;
 
@@ -1569,8 +1570,13 @@ GuestTextureResource mirrorResource(const DepthTarget& target) {
     return resource;
 }
 
+std::uint64_t mirrorPlaneBytes(const DepthSurface& surface) {
+    if (surface.planeBytes == 0) surface.planeBytes = DescribeSurface(mirrorResource(surface.target)).guestBytes;
+    return surface.planeBytes;
+}
+
 std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surface) {
-    return {surface.target.address, surface.target.address + DescribeSurface(mirrorResource(surface.target)).guestBytes};
+    return {surface.target.address, surface.target.address + mirrorPlaneBytes(surface)};
 }
 
 void retire(DepthSurface& surface) {
@@ -1755,7 +1761,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) static_cast<void>(surface->SyncFromMemory(mirrorResource(target)));
+    if (mirrorable(target)) static_cast<void>(surface->SyncFromMemory(mirrorResource(target), mirrorPlaneBytes(*surface)));
     surface->ApplyFastClear();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
@@ -1771,10 +1777,9 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
             other->DropMirror();
         }
     }
-    if ((depthWritten || cleared) && mirrorable(target)) {
+    if ((depthWritten || cleared) && mirrorable(target) && !surface->memoryStale) {
         surface->memoryStale = true;
-        const auto plane = target.address;
-        noteStalePlane(plane, plane + DescribeSurface(mirrorResource(target)).guestBytes);
+        noteStalePlane(target.address, target.address + mirrorPlaneBytes(*surface));
     }
     drawnDepth = surface;
     return surface->view;
@@ -1803,13 +1808,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
             if (!surface->memoryStale) continue;
             const auto resource = mirrorResource(surface->target);
             const auto plane = surface->target.address;
-            const auto planeBytes = DescribeSurface(resource).guestBytes;
+            const auto planeBytes = mirrorPlaneBytes(*surface);
             if (plane >= end || address >= plane + planeBytes) {
                 remaining.emplace_back(plane, plane + planeBytes);
                 continue;
             }
             surface->memoryStale = false;
-            if (surface->SyncFromMemory(resource)) continue;
+            if (surface->SyncFromMemory(resource, planeBytes)) continue;
             stored.emplace_back(surface.get(), surface->StoreDepthPlane(resource));
             ranges.emplace_back(plane, planeBytes);
         }
