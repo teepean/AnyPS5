@@ -627,6 +627,9 @@ private:
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::weak_ptr<DrawBindings> lastDrawBindings;
     mutable std::vector<std::size_t> lastDrawSelected;
+    mutable const DrawBindings* keptBindings = nullptr;
+    mutable const Recorder* keptRecorder = nullptr;
+    mutable std::uint64_t keptGeneration = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     struct BufferSlot {
         std::uint32_t set;

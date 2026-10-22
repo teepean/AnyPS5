@@ -5911,8 +5911,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     };
     if (result == nullptr && last != nullptr && matched == last->snapshots.size() && lastDrawSelected == selected) {
-        recorder.Keep(last);
-        keepBuffers(*last);
+        if (keptBindings != last.get() || keptRecorder != &recorder || keptGeneration == 0 || keptGeneration != recorder.OpenBatchGeneration()) {
+            recorder.Keep(last);
+            keepBuffers(*last);
+            keptBindings = last.get();
+            keptRecorder = &recorder;
+            keptGeneration = recorder.OpenBatchGeneration();
+        }
         return last;
     }
     if (result == nullptr) startResult();
@@ -6029,6 +6034,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (!movedOnly) {
         lastDrawBindings = result;
         lastDrawSelected = selected;
+        keptBindings = result.get();
+        keptRecorder = &recorder;
+        keptGeneration = recorder.OpenBatchGeneration();
     }
     return result;
 }

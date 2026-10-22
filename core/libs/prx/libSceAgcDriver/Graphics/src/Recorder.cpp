@@ -1644,6 +1644,8 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        static std::atomic<std::uint64_t> generations{0};
+        openGeneration = generations.fetch_add(1, std::memory_order_relaxed) + 1;
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
