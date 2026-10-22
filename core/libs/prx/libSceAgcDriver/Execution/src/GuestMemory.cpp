@@ -1901,7 +1901,7 @@ private:
     }
 
     void run() {
-        PerformanceTrace::BindThread("write collector");
+        pthread_setname_np(pthread_self(), "write collector");
         std::uint64_t handled = 0;
         try {
             for (;;) {
