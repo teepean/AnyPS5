@@ -313,8 +313,8 @@ void Driver::commitSampleDump(std::uint64_t address, std::uint32_t queue) {
     {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        if (const auto localDevice = device.Load()) {
-            recordDeferredLabels(localDevice.get(), queue);
+        if (auto* const localDevice = device.UnderGpuLock()) {
+            recordDeferredLabels(localDevice, queue);
             wrote = localDevice->DumpSamplesOnGpu(address);
             if (!wrote) localDevice->WaitIdle();
         }
@@ -391,9 +391,9 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    const auto localDevice = device.Load();
+    auto* const localDevice = device.UnderGpuLock();
     Graphics::StorageTexture::FlushPending(address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
-    recordDeferredLabels(localDevice.get(), queue);
+    recordDeferredLabels(localDevice, queue);
     int reason = 4;
     std::uint64_t stamp = 0;
     if (bytes.size() <= gpuStoreLimit && localDevice != nullptr) {
@@ -450,8 +450,8 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    const auto localDevice = device.Load();
-    recordDeferredLabels(localDevice.get(), queue);
+    auto* const localDevice = device.UnderGpuLock();
+    recordDeferredLabels(localDevice, queue);
     const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
@@ -476,7 +476,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         }
         if (!deferred) deliverGuestEopInterrupt(queue);
     }
-    submitDueAfterCommit(localDevice.get());
+    submitDueAfterCommit(localDevice);
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {

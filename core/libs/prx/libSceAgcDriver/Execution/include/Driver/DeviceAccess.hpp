@@ -14,6 +14,8 @@ namespace AgcDriver::DriverDetail {
 class DevicePointer {
 public:
     std::shared_ptr<VulkanDevice> Load() const;
+    std::shared_ptr<VulkanDevice> LoadCached() const;
+    VulkanDevice* UnderGpuLock() const;
     operator std::shared_ptr<VulkanDevice>() const;
     DevicePointer& operator=(std::shared_ptr<VulkanDevice> value);
     void Reset();
@@ -23,6 +25,7 @@ public:
 
 private:
     AtomicSharedPtr<VulkanDevice> pointer;
+    alignas(64) std::atomic<VulkanDevice*> installed{nullptr};
 };
 
 class DeviceUseGate {

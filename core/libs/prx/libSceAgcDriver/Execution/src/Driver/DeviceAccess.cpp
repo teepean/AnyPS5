@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -7,8 +8,32 @@ std::shared_ptr<VulkanDevice> DevicePointer::Load() const { return pointer.load(
 
 DevicePointer::operator std::shared_ptr<VulkanDevice>() const { return Load(); }
 
+std::shared_ptr<VulkanDevice> DevicePointer::LoadCached() const {
+    struct Slot {
+        const DevicePointer* owner = nullptr;
+        VulkanDevice* device = nullptr;
+        std::weak_ptr<VulkanDevice> held;
+    };
+    thread_local Slot slot;
+    if (auto* const current = installed.load(std::memory_order_acquire); current != nullptr && slot.owner == this && slot.device == current) {
+        if (auto pinned = slot.held.lock()) return pinned;
+    }
+    auto loaded = Load();
+    slot.owner = this;
+    slot.device = loaded.get();
+    slot.held = loaded;
+    return loaded;
+}
+
+VulkanDevice* DevicePointer::UnderGpuLock() const {
+    GuestMemory::AssertGpuLockHeld("DevicePointer::UnderGpuLock");
+    return installed.load(std::memory_order_acquire);
+}
+
 DevicePointer& DevicePointer::operator=(std::shared_ptr<VulkanDevice> value) {
-    pointer.store(std::move(value), std::memory_order_release);
+    auto* const next = value.get();
+    const auto previous = pointer.exchange(std::move(value), std::memory_order_acq_rel);
+    installed.store(next, std::memory_order_release);
     return *this;
 }
 

@@ -97,7 +97,7 @@ bool& drawnSinceSeal() {
 void Driver::commitSeal() {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
+    if (auto* const localDevice = device.UnderGpuLock()) localDevice->SealPassWriteOnly();
 }
 
 void Driver::deliverGuestEopInterrupt(std::uint32_t queue) {
