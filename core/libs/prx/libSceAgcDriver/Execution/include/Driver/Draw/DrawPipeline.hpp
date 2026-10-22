@@ -10,9 +10,11 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <type_traits>
 #include <typeinfo>
 #include <utility>
 #include <span>
@@ -22,7 +24,33 @@ namespace AgcDriver::DriverDetail {
 
 class DrawPipeline {
 public:
-    using Commit = std::function<void()>;
+    class Commit {
+    public:
+        Commit() = default;
+        template <class Callable, class = std::enable_if_t<!std::is_same_v<std::decay_t<Callable>, Commit>>>
+        Commit(Callable&& callable) : impl(std::make_unique<Model<std::decay_t<Callable>>>(std::forward<Callable>(callable))) {}
+        Commit(Commit&&) noexcept = default;
+        Commit& operator=(Commit&&) noexcept = default;
+        void operator()() { impl->Call(); }
+        explicit operator bool() const { return impl != nullptr; }
+        const std::type_info& target_type() const { return impl != nullptr ? impl->Type() : typeid(void); }
+
+    private:
+        struct Concept {
+            virtual ~Concept() = default;
+            virtual void Call() = 0;
+            virtual const std::type_info& Type() const = 0;
+        };
+        template <class Callable>
+        struct Model final : Concept {
+            explicit Model(Callable&& callable) : callable(std::move(callable)) {}
+            explicit Model(const Callable& callable) : callable(callable) {}
+            void Call() override { callable(); }
+            const std::type_info& Type() const override { return typeid(Callable); }
+            Callable callable;
+        };
+        std::unique_ptr<Concept> impl;
+    };
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
 

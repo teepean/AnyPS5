@@ -648,8 +648,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     commitDraw(localDevice.get(), commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, 0, 0);
                 };
-                auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+                DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes));
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
                 return drawn();
@@ -700,8 +699,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice.get(), commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, sequence, repeatOf, std::move(shaderKey));
         };
-        auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
+        DrawPipeline::Queue0().Enqueue(std::move(commit), std::move(writes), 0, {}, std::move(reads));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
