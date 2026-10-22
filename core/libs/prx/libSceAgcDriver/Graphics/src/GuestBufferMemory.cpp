@@ -298,7 +298,10 @@ bool recentImportsEnabled() {
 const HostImport* recentImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
     if (state.recentEpoch != state.epoch || state.recentSize != state.imports.size()) return nullptr;
     for (const auto* entry : state.recentImports) {
-        if (entry != nullptr && begin >= entry->base && end <= entry->base + entry->bytes) return entry;
+        if (entry != nullptr && begin >= entry->base && end <= entry->base + entry->bytes) {
+            entry->lastUse = ++state.useCounter;
+            return entry;
+        }
     }
     return nullptr;
 }
