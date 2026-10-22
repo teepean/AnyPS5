@@ -5804,18 +5804,22 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto startResult = [&] {
         result = std::make_shared<DrawBindings>();
         result->snapshots.reserve(allocations.size());
-        if (last != nullptr) result->snapshots.assign(last->snapshots.begin(), last->snapshots.begin() + static_cast<std::ptrdiff_t>(matched));
+        if (last != nullptr && matched != 0) {
+            result->snapshots.assign(last->snapshots.begin(), last->snapshots.begin() + static_cast<std::ptrdiff_t>(matched));
+            result->buffers = last->buffers;
+        }
     };
     const auto keep = [&](std::uint64_t address, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset, std::size_t bytes) {
         if (result == nullptr && last != nullptr && matched < last->snapshots.size()) {
             const auto& held = last->snapshots[matched];
-            if (held.address == address && held.buffer == buffer && held.offset == offset && held.bytes == bytes) {
+            if (held.address == address && held.buffer == buffer.get() && held.offset == offset && held.bytes == bytes) {
                 ++matched;
                 return;
             }
         }
         if (result == nullptr) startResult();
-        result->snapshots.push_back({address, buffer, offset, bytes});
+        result->snapshots.push_back({address, buffer.get(), offset, bytes});
+        if (std::none_of(result->buffers.begin(), result->buffers.end(), [&](const std::shared_ptr<Buffer>& held) { return held.get() == buffer.get(); })) result->buffers.push_back(buffer);
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -5903,12 +5907,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     const auto keepBuffers = [&](const DrawBindings& bindings) {
-        const Buffer* kept = nullptr;
-        for (const auto& snapshot : bindings.snapshots) {
-            if (snapshot.buffer.get() == kept) continue;
-            kept = snapshot.buffer.get();
-            recorder.KeepBytes(kept, snapshot.buffer->Bytes().size());
-        }
+        for (const auto& buffer : bindings.buffers) recorder.KeepBytes(buffer.get(), buffer->Bytes().size());
     };
     if (result == nullptr && last != nullptr && matched == last->snapshots.size() && lastDrawSelected == selected) {
         if (keptBindings != last.get() || keptRecorder != &recorder || keptGeneration == 0 || keptGeneration != recorder.OpenBatchGeneration()) {

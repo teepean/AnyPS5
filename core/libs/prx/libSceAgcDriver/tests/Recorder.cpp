@@ -3899,8 +3899,10 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         const auto snapshot = [&](std::byte expected) {
             const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            const auto buffer = bindings->snapshots[0].buffer;
-            const auto contents = buffer->Bytes();
+            const auto held = std::find_if(bindings->buffers.begin(), bindings->buffers.end(), [&](const auto& buffer) { return buffer.get() == bindings->snapshots[0].buffer; });
+            Require(held != bindings->buffers.end(), "draw bindings do not hold their snapshot's buffer");
+            const auto buffer = *held;
+            const auto contents = bindings->snapshots[0].Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
         };
@@ -3920,7 +3922,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         Require(snapshot(std::byte{0x33}) == afterStore, "a driver store of the same bytes made the draw input copy again");
         reinterpret_cast<std::uint8_t*>(element)[elementBytes - 1] = 0x34;
         const auto tail = resources.PrepareDrawBindings(snapshotRecorder);
-        Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
+        Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore.get() && tail->snapshots[0].Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         {
             GuestAllocations::Mutation mutation;

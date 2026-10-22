@@ -188,7 +188,7 @@ public:
         DrawBindings& operator=(const DrawBindings&) = delete;
         struct Snapshot {
             std::uint64_t address;
-            std::shared_ptr<Buffer> buffer;
+            Buffer* buffer = nullptr;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
@@ -199,6 +199,7 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::vector<std::shared_ptr<Buffer>> buffers;
         std::shared_ptr<OwnedSets> owner;
         std::vector<std::uint32_t> snapshotSlots;
         ~DrawBindings();
