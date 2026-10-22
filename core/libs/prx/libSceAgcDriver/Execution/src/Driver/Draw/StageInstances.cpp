@@ -868,7 +868,7 @@ void StageInstanceLearn(std::uint64_t key, const std::shared_ptr<const void>& sh
     value.shapes[key] = std::move(next);
 }
 
-void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& variant, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions) {
+void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& variant, std::uint64_t codeAddress, const ShaderRecompiler::RecompileResult& fast, std::span<const ShaderRecompiler::MemoryRegion> fastRegions, const ShaderRecompiler::RecompileResult& full, std::span<const ShaderRecompiler::MemoryRegion> fullRegions, std::span<const std::uint32_t> userData) {
     auto& value = state();
     const auto held = std::static_pointer_cast<const Entry>(variant);
     const auto patchFor = [&](FieldKind kind, std::uint32_t binding, std::uint32_t word) -> const Patch* {
@@ -881,6 +881,58 @@ void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& 
     enum class Kind { Same, Shape, Patched, Unpatched, Attribute };
     Kind kind = Kind::Same;
     char detail[240] = "";
+    std::string sources;
+    const auto describe = [&](std::uint32_t binding, std::uint32_t word, std::uint32_t fastValue, std::uint32_t fullValue) {
+        if (held == nullptr) return;
+        char piece[160];
+        const auto append = [&] {
+            if (sources.size() < 900) sources += piece;
+        };
+        std::snprintf(piece, sizeof(piece), "fast 0x%08x from", fastValue);
+        append();
+        for (std::size_t u = 0; u < held->userData.size(); ++u) {
+            if (held->userData[u] != fastValue) continue;
+            std::snprintf(piece, sizeof(piece), " learned user %zu%s", u, u < held->userObserved.size() && held->userObserved[u] ? " (observed)" : "");
+            append();
+        }
+        for (std::size_t w = 0; w < held->words.size(); ++w) {
+            if (held->words[w] != fastValue) continue;
+            std::snprintf(piece, sizeof(piece), " learned word %zu%s", w, w < held->wordObserved.size() && held->wordObserved[w] ? " (observed)" : "");
+            append();
+        }
+        std::snprintf(piece, sizeof(piece), "; full 0x%08x from", fullValue);
+        append();
+        for (std::size_t u = 0; u < userData.size(); ++u) {
+            if (userData[u] != fullValue) continue;
+            std::snprintf(piece, sizeof(piece), " user %zu (learned 0x%08x%s)", u, u < held->userData.size() ? held->userData[u] : 0u, u < held->userObserved.size() && held->userObserved[u] ? ", observed" : "");
+            append();
+        }
+        for (const auto& region : fullRegions) {
+            for (std::size_t offset = 0; offset + sizeof(std::uint32_t) <= region.bytes.size(); offset += sizeof(std::uint32_t)) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, region.bytes.data() + offset, sizeof(value));
+                if (value != fullValue) continue;
+                std::snprintf(piece, sizeof(piece), " at 0x%llx", static_cast<unsigned long long>(region.guestAddress + offset));
+                append();
+            }
+        }
+        std::snprintf(piece, sizeof(piece), "; runs");
+        append();
+        for (const auto& run : held->runs) {
+            std::snprintf(piece, sizeof(piece), " (%d +0x%llx %u words from %u)", run.origin, static_cast<unsigned long long>(run.at), run.words, run.first);
+            append();
+        }
+        for (const auto neighbour : {word - 1u, word + 1u}) {
+            if (neighbour >= full.bindings[binding].guestDescriptor.size()) continue;
+            const Patch* patch = nullptr;
+            for (const auto& candidate : held->patches) {
+                if (candidate.kind == FieldKind::Binding && candidate.binding == binding && candidate.word == neighbour) patch = &candidate;
+            }
+            if (patch == nullptr) std::snprintf(piece, sizeof(piece), "; word %u 0x%08x/0x%08x not patched", neighbour, fast.bindings[binding].guestDescriptor[neighbour], full.bindings[binding].guestDescriptor[neighbour]);
+            else std::snprintf(piece, sizeof(piece), "; word %u patched from %s %u + %u", neighbour, patch->source.kind == SourceKind::User ? "user" : patch->source.kind == SourceKind::Word ? "word" : patch->source.kind == SourceKind::Draw ? "draw" : "vertex", patch->source.index, patch->source.delta);
+            append();
+        }
+    };
     if (fast.PipelineVariantId() != full.PipelineVariantId() || fast.bindings.size() != full.bindings.size() || fast.pushConstants.size() != full.pushConstants.size() || fast.vertexAttributes.size() != full.vertexAttributes.size()) {
         kind = Kind::Shape;
         std::snprintf(detail, sizeof(detail), "shape: variant 0x%llx / 0x%llx, bindings %zu / %zu, push %zu / %zu", static_cast<unsigned long long>(fast.PipelineVariantId()), static_cast<unsigned long long>(full.PipelineVariantId()), fast.bindings.size(), full.bindings.size(), fast.pushConstants.size(), full.pushConstants.size());
@@ -899,6 +951,7 @@ void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& 
             if (patch == nullptr && y.role == ShaderRecompiler::DescriptorRole::GuestBuffers && w % 4u < 2u) patch = patchFor(FieldKind::Address, b, w / 4u);
             kind = patch != nullptr ? Kind::Patched : Kind::Unpatched;
             std::snprintf(detail, sizeof(detail), "binding %u (role %u, count %u) word %u: fast 0x%08x full 0x%08x, %s", b, static_cast<unsigned>(y.role), y.count, w, x.guestDescriptor[w], y.guestDescriptor[w], patch == nullptr ? "not patched" : patch->source.kind == SourceKind::User ? "patched from a user word" : patch->source.kind == SourceKind::Word ? "patched from a read word" : patch->source.kind == SourceKind::Draw ? "patched from a draw parameter" : "patched from a vertex word");
+            if (kind == Kind::Unpatched && StageInstancesVerify()) describe(b, w, x.guestDescriptor[w], y.guestDescriptor[w]);
             break;
         }
     }
@@ -965,7 +1018,10 @@ void StageInstanceCompare(std::uint64_t key, const std::shared_ptr<const void>& 
     static std::atomic<int> shownPatched{0};
     static std::atomic<int> shownOther{0};
     auto& shown = kind == Kind::Patched ? shownPatched : shownOther;
-    if ((kind != Kind::Same || !sameRegions) && shown.fetch_add(1) < 25) std::fprintf(stderr, "[stage-instances] verify: program 0x%llx: %s%s (entry stable %u, %zu patches)\n", static_cast<unsigned long long>(codeAddress), kind == Kind::Same ? "result equal" : detail, sameRegions ? "" : "; regions differ", held != nullptr ? held->stable : 0u, held != nullptr ? held->patches.size() : 0u);
+    if ((kind != Kind::Same || !sameRegions) && shown.fetch_add(1) < 25) {
+        std::fprintf(stderr, "[stage-instances] verify: program 0x%llx: %s%s (entry stable %u, %zu patches)\n", static_cast<unsigned long long>(codeAddress), kind == Kind::Same ? "result equal" : detail, sameRegions ? "" : "; regions differ", held != nullptr ? held->stable : 0u, held != nullptr ? held->patches.size() : 0u);
+        if (!sources.empty()) std::fprintf(stderr, "[stage-instances] verify sources: program 0x%llx: %s\n", static_cast<unsigned long long>(codeAddress), sources.c_str());
+    }
 }
 
 void StageInstanceTimed(double fastMicroseconds, double fullMicroseconds) {
