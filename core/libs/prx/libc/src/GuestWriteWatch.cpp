@@ -61,6 +61,7 @@ public:
         std::unique_lock lock(_lock);
         remove(_ranges, begin, end);
         remove(_fresh, begin, end);
+        syncFresh();
         uffdio_register registration{};
         registration.range.start = begin;
         registration.range.len = end - begin;
@@ -76,6 +77,7 @@ public:
         }
         insert(_ranges, begin, end);
         insert(_fresh, begin, end);
+        syncFresh();
         _version.fetch_add(1, std::memory_order_release);
     }
 
@@ -84,6 +86,7 @@ public:
         std::unique_lock lock(_lock);
         const bool watched = remove(_ranges, begin, end);
         remove(_fresh, begin, end);
+        syncFresh();
         _version.fetch_add(1, std::memory_order_release);
         return watched;
     }
@@ -118,6 +121,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
+        if (_freshCount.load(std::memory_order_acquire) == 0 && Covers(begin, end)) return scanWritten(begin, end, written, context);
         if (!takeFresh(begin, end, true, written, context)) return false;
         return scanWritten(begin, end, written, context);
     }
@@ -127,6 +131,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
+        if (_freshCount.load(std::memory_order_acquire) == 0) return true;
         {
             std::shared_lock lock(_lock);
             auto it = _fresh.upper_bound(begin);
@@ -142,6 +147,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
+        if (_freshCount.load(std::memory_order_acquire) == 0 && Covers(begin, end)) return scanWritten(begin, end, written, context);
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armed;
         {
             std::shared_lock lock(_lock);
@@ -163,6 +169,10 @@ public:
     }
 
 private:
+    void syncFresh() {
+        _freshCount.store(_fresh.size(), std::memory_order_release);
+    }
+
     bool takeFresh(std::uintptr_t begin, std::uintptr_t end, bool whole, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> fresh;
         {
@@ -176,6 +186,7 @@ private:
                 if (from < to) fresh.emplace_back(from, to);
             }
             for (const auto& [from, to] : fresh) remove(_fresh, from, to);
+            syncFresh();
         }
         for (const auto& [from, to] : fresh) {
             written(context, from, to);
@@ -186,6 +197,7 @@ private:
                 remove(_fresh, left, right);
                 insert(_fresh, left, right);
             }
+            syncFresh();
             if (whole) written(context, begin, end);
             else for (const auto& [left, right] : fresh) written(context, left, right);
             return false;
@@ -337,6 +349,7 @@ private:
     std::shared_mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
+    std::atomic<std::size_t> _freshCount{0};
     std::atomic<std::uint64_t> _version{0};
 };
 
