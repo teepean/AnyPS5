@@ -1,4 +1,5 @@
 add_library(libSceFiber SHARED EXCLUDE_FROM_ALL Export.cpp)
+set_source_files_properties(Export.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 target_include_directories(libSceFiber PRIVATE ${LIBS_INCLUDE_DIR})
 target_compile_options(libSceFiber PRIVATE -fno-omit-frame-pointer)
 configure_windows_unwind(libSceFiber)
