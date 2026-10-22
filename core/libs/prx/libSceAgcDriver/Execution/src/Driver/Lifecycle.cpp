@@ -32,9 +32,38 @@
 #include <sys/mman.h>
 #endif
 
+#ifdef APS5_PGO_GENERATE
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+extern "C" void __gcov_dump(void);
+extern "C" void __gcov_reset(void);
+#endif
+
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+#ifdef APS5_PGO_GENERATE
+const bool profileTraining = [] {
+    const char* dump = std::getenv("APS5_PGO_DUMP_AFTER");
+    if (dump == nullptr) return false;
+    const auto dumpAt = std::strtoul(dump, nullptr, 10);
+    const char* reset = std::getenv("APS5_PGO_RESET_AFTER");
+    const auto resetAt = reset != nullptr ? std::min(std::strtoul(reset, nullptr, 10), dumpAt) : 0ul;
+    std::thread([resetAt, dumpAt] {
+        std::this_thread::sleep_for(std::chrono::seconds(resetAt));
+        if (resetAt != 0) {
+            __gcov_reset();
+            std::fprintf(stderr, "[pgo] counters reset at %lu s\n", resetAt);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(dumpAt - resetAt));
+        __gcov_dump();
+        std::fprintf(stderr, "[pgo] profile written at %lu s\n", dumpAt);
+    }).detach();
+    return true;
+}();
+#endif
 
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
