@@ -94,6 +94,12 @@ bool& drawnSinceSeal() {
 
 }
 
+void Driver::commitSeal() {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
+}
+
 void Driver::deliverGuestEopInterrupt(std::uint32_t queue) {
     if (!AgcDriverDeliverEopInterrupt(queue)) return;
     std::lock_guard<std::mutex> lock(eopSelfSignalMutex);
@@ -481,13 +487,11 @@ void Driver::execute(const Submission& submission) {
             dumpSampleCounters(Pm4::SampleDumpAddress(packet));
         } else if (submission.queue == 0 && sealsWriteOnly(packet, opcode)) {
             if (std::exchange(drawnSinceSeal(), false)) {
-                const auto seal = [this] {
-                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
-                };
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
-                else seal();
+                if (pipelined && DrawPipeline::Queue0().Busy()) {
+                    if (!DrawPipeline::LabelRuns() || !DrawPipeline::Queue0().AttachSeal(submission.queue)) DrawPipeline::Queue0().Enqueue([this] { commitSeal(); }, {});
+                } else {
+                    commitSeal();
+                }
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {

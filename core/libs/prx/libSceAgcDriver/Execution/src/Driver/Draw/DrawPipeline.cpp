@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -113,11 +114,16 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+bool DrawPipeline::LabelRuns() {
+    static const bool enabled = std::getenv("APS5_LABEL_RUNS") != nullptr;
+    return enabled;
+}
+
 bool DrawPipeline::attach(const Follower& follower, std::uint32_t queue) {
-    constexpr std::size_t MaxFollowers = 16;
+    const std::size_t maxFollowers = LabelRuns() ? 64 : 16;
     if (closing || stopped || items.size() < 2) return false;
     auto& last = items.back();
-    if (!last.labelBytes.empty() || last.followers.size() >= MaxFollowers || (!last.followers.empty() && last.followerQueue != queue)) return false;
+    if ((!LabelRuns() && !last.labelBytes.empty()) || last.followers.size() >= maxFollowers || (!last.followers.empty() && last.followerQueue != queue)) return false;
     last.followers.push_back(follower);
     last.followerQueue = queue;
     return true;
@@ -131,6 +137,15 @@ bool DrawPipeline::AttachSampleDump(std::uint64_t address, std::uint32_t queue, 
     follower.end = write.second;
     if (!attach(follower, queue)) return false;
     ++attachedDumps;
+    return true;
+}
+
+bool DrawPipeline::AttachSeal(std::uint32_t queue) {
+    std::lock_guard lock(mutex);
+    Follower follower;
+    follower.seal = true;
+    if (!attach(follower, queue)) return false;
+    ++attachedSeals;
     return true;
 }
 
@@ -172,8 +187,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[64];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
     drainText += reads;
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps and %llu labels attached to queued items;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), reads, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = attachedLabels = 0;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps, %llu labels and %llu write-only seals attached to queued items;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), static_cast<unsigned long long>(attachedSeals), reads, drainText.c_str());
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = attachedLabels = attachedSeals = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -203,8 +218,14 @@ void DrawPipeline::run() {
             if (commit != nullptr) {
                 (*commit)();
                 const auto& item = items.front();
+                std::optional<std::lock_guard<GuestMemory::GpuMutexType>> hold;
+                if (LabelRuns() && item.followers.size() > 1) {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                    hold.emplace(GuestMemory::GpuMutex());
+                }
                 for (const auto& follower : item.followers) {
-                    if (follower.size == 0) Driver::Get().commitSampleDump(follower.address, item.followerQueue);
+                    if (follower.seal) Driver::Get().commitSeal();
+                    else if (follower.size == 0) Driver::Get().commitSampleDump(follower.address, item.followerQueue);
                     else Driver::Get().commitAttachedLabel(item.followerQueue, follower.opcode, follower.address, std::span(follower.bytes.data(), follower.size));
                 }
             }
