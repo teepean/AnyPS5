@@ -1,3 +1,4 @@
+import contextlib
 import io
 import sys
 import tempfile
@@ -117,6 +118,17 @@ class EnvReferenceTests(unittest.TestCase):
         (core / "Sample.cpp").write_text('static bool a = IsEnvironmentSet("APS5_TRACE_GPU");\n', encoding="utf-8")
         (core / "3rdparty" / "Ignored.cpp").write_text('static bool b = IsEnvironmentSet("APS5_IGNORED");\n', encoding="utf-8")
         self.assertEqual(set(env_reference.reads([core], BOTH)), {"APS5_TRACE_GPU"})
+
+    def test_main_rejects_a_scan_root_that_is_not_a_directory(self):
+        root = self.fixture()
+        for name in ("missing", "core/Sample.cpp"):
+            for flags in (["--check"], ["--table"], []):
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+                    code = env_reference.main(flags + ["--doc", str(root / "ENVIRONMENT.md"), "--root", str(root / name)])
+                self.assertEqual(code, 1, (name, flags))
+                self.assertIn("is not a directory", err.getvalue())
+                self.assertNotIn("no longer reads", out.getvalue())
 
 
 if __name__ == "__main__":

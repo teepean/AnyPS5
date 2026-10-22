@@ -172,6 +172,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     roots = args.root if args.root else ROOTS
     prefixes = tuple(args.prefix) if args.prefix else PREFIXES
+    for root in roots:
+        if not Path(root).is_dir():
+            print(f"error: scan root {root} is not a directory", file=sys.stderr)
+            return 1
     found = reads(roots, prefixes)
     if args.check:
         return check(found, args.doc, prefixes, sys.stdout)

@@ -813,18 +813,33 @@ constexpr std::size_t WritePagesPerBlock = WriteBlockBytes / WritePageBytes;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
-constexpr std::array<std::byte, WritePageBytes> ZeroPage{};
+std::uint64_t HashPage(const std::byte* page) {
+    constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
+    constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
+    constexpr std::uint64_t prime3 = 0x165667B19E3779F9ull;
+    constexpr std::uint64_t prime4 = 0x85EBCA77C2B2AE63ull;
+    const auto round = [](std::uint64_t accumulator, std::uint64_t word) { return std::rotl(accumulator + word * prime2, 31) * prime1; };
+    std::array<std::uint64_t, 4> lanes{prime1 + prime2, prime2, 0, 0 - prime1};
+    for (std::size_t offset = 0; offset < WritePageBytes; offset += 4 * sizeof(std::uint64_t)) {
+        std::array<std::uint64_t, 4> words;
+        std::memcpy(words.data(), page + offset, sizeof(words));
+        for (std::size_t lane = 0; lane < 4; ++lane) lanes[lane] = round(lanes[lane], words[lane]);
+    }
+    std::uint64_t hash = std::rotl(lanes[0], 1) + std::rotl(lanes[1], 7) + std::rotl(lanes[2], 12) + std::rotl(lanes[3], 18);
+    for (const auto lane : lanes) hash = (hash ^ round(0, lane)) * prime1 + prime4;
+    hash ^= hash >> 33;
+    hash *= prime2;
+    hash ^= hash >> 29;
+    hash *= prime3;
+    return hash ^ (hash >> 32);
+}
 
 struct WindowCopy {
-    static constexpr std::uint32_t Zero = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t first;
-    std::span<const std::byte> bytes;
-    std::span<const std::uint32_t> slots;
+    std::span<const std::uint64_t> hashes;
 
     bool Holds(std::uintptr_t page) const {
-        const auto slot = slots[(page - first) / WritePageBytes];
-        const auto* expected = slot == Zero ? ZeroPage.data() : bytes.data() + static_cast<std::size_t>(slot) * WritePageBytes;
-        return std::memcmp(reinterpret_cast<const void*>(page), expected, WritePageBytes) == 0;
+        return HashPage(reinterpret_cast<const std::byte*>(page)) == hashes[(page - first) / WritePageBytes];
     }
 };
 
@@ -873,6 +888,7 @@ struct WriteTracker {
         std::uintptr_t end = 0;
         std::uint64_t epoch = 0;
         std::uint64_t unwatched = 0;
+        std::uint64_t mapping = 0;
     };
     std::array<Memo, 256> memo{};
     std::size_t nextMemo = 0;
@@ -1245,6 +1261,7 @@ struct EpochCollectMap {
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
     std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> spans;
 };
 
@@ -1266,16 +1283,17 @@ bool collectSpansEnabled() {
 
 constexpr std::size_t CollectSpanLimit = 4096;
 
-bool spanCollected(const EpochCollectMap& map, std::uint64_t unwatched, std::uintptr_t first, std::uintptr_t stop) {
-    if (map.unwatched != unwatched || map.spans.empty()) return false;
+bool spanCollected(const EpochCollectMap& map, std::uint64_t unwatched, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
+    if (map.unwatched != unwatched || map.mapping != mapping || map.spans.empty()) return false;
     const auto next = std::upper_bound(map.spans.begin(), map.spans.end(), first, [](std::uintptr_t value, const auto& span) { return value < span.first; });
     return next != map.spans.begin() && stop <= std::prev(next)->second;
 }
 
-void noteCollectedSpan(EpochCollectMap& map, std::uint64_t unwatched, std::uintptr_t first, std::uintptr_t stop) {
-    if (map.unwatched != unwatched || map.spans.size() >= CollectSpanLimit) {
+void noteCollectedSpan(EpochCollectMap& map, std::uint64_t unwatched, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
+    if (map.unwatched != unwatched || map.mapping != mapping || map.spans.size() >= CollectSpanLimit) {
         map.spans.clear();
         map.unwatched = unwatched;
+        map.mapping = mapping;
     }
     auto begin = std::upper_bound(map.spans.begin(), map.spans.end(), first, [](std::uintptr_t value, const auto& span) { return value < span.first; });
     if (begin != map.spans.begin() && std::prev(begin)->second >= first) --begin;
@@ -1385,19 +1403,20 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
         for (const auto& entry : threadCollectMemo.entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
@@ -1405,7 +1424,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
-        if (epochCollectMapEnabled() && collectSpansEnabled() && spanCollected(epochCollectMap(epoch), unwatched, first, stop)) {
+        if (epochCollectMapEnabled() && collectSpansEnabled() && spanCollected(epochCollectMap(epoch), unwatched, mapping, first, stop)) {
             collectMemoHits.fetch_add(1, std::memory_order_relaxed);
             return tracker.generation.load(std::memory_order_relaxed);
         }
@@ -1416,7 +1435,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
-            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
@@ -1437,14 +1456,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
+        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
         else {
-            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial, mapping};
             if (epochCollectMapEnabled()) {
                 auto& map = epochCollectMap(epoch);
                 auto& entry = map.ranges[first];
-                if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
-                if (collectSpansEnabled()) noteCollectedSpan(map, serial, first, stop);
+                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
+                if (collectSpansEnabled()) noteCollectedSpan(map, serial, mapping, first, stop);
             }
         }
     }
@@ -1610,23 +1629,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
             begin = end;
         }
     }
-    std::vector<std::uint32_t> slots(static_cast<std::size_t>((stop - first) / page), WindowCopy::Zero);
-    std::size_t kept = 0;
+    std::vector<std::uint64_t> hashes(static_cast<std::size_t>((stop - first) / page), 0);
     for (const auto& [begin, end] : spans) {
         CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
         for (auto cursor = begin; cursor < end; cursor += page) {
-            if (std::memcmp(reinterpret_cast<const void*>(cursor), ZeroPage.data(), page) != 0) slots[static_cast<std::size_t>((cursor - first) / page)] = static_cast<std::uint32_t>(kept++);
+            hashes[static_cast<std::size_t>((cursor - first) / page)] = HashPage(reinterpret_cast<const std::byte*>(cursor));
         }
-    }
-    std::vector<std::byte> saved;
-    saved.reserve(kept * page);
-    const auto* source = reinterpret_cast<const std::byte*>(first);
-    for (std::size_t index = 0; index < slots.size(); ++index) {
-        if (slots[index] != WindowCopy::Zero) saved.insert(saved.end(), source + index * page, source + (index + 1) * page);
     }
     std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
     if (!runImport()) return false;
-    const WindowCopy window{first, saved, slots};
+    const WindowCopy window{first, hashes};
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
         if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
@@ -1874,15 +1886,16 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     tracker.initialize();
     if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
-        return entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end;
+        return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
-        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched};
+        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};
     }
     return tracker.newestHint(first, stop);
 #else
