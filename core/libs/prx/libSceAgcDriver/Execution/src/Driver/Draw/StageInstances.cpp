@@ -94,8 +94,8 @@ struct Shape {
 enum Miss : std::uint8_t { MissNoEntry, MissNotLearned, MissBlocked, MissNotReady, MissUser, MissPointerFlags, MissVertex, MissDraw, MissRead, MissWord, MissCarry, MissCount };
 constexpr const char* MissNames[MissCount] = {"no entry", "not learned", "tables or poison", "not confirmed", "user word", "pointer flags", "vertex", "draw", "read", "run word", "carry"};
 
-enum LearnFail : std::uint8_t { FailStructure, FailVariant, FailBindings, FailPushSize, FailVertex, FailForwarded, FailDescriptor, FailNoSource, FailCount };
-constexpr const char* LearnFailNames[FailCount] = {"structure", "variant", "bindings", "push size", "vertex", "forwarded words", "texture or sampler", "no source"};
+enum LearnFail : std::uint8_t { FailStructure, FailVariant, FailBindings, FailPushSize, FailVertex, FailForwarded, FailDescriptor, FailNoSource, FailLostPatch, FailCount };
+constexpr const char* LearnFailNames[FailCount] = {"structure", "variant", "bindings", "push size", "vertex", "forwarded words", "texture or sampler", "no source", "patch lost"};
 
 struct Counters {
     std::uint64_t lookups = 0;
@@ -464,7 +464,7 @@ std::optional<LearnFail> learn(const Entry& entry, Entry& next, const std::vecto
         if (patch.kind == FieldKind::Address) {
             if (patch.binding >= current.bindings.size() || patch.word >= current.bindings[patch.binding].count || !bufferQuads(current.bindings[patch.binding]) || !pairExists(patch.source, userData.size(), words.size(), vertex)) continue;
             if (addressOf(previous.bindings[patch.binding], patch.word) != addressValue(patch.source, entry.userData, entry.words, entry.vertex, entry.draw)) continue;
-            if (addressOf(current.bindings[patch.binding], patch.word) != addressValue(patch.source, userData, words, vertex, draw)) continue;
+            if (addressOf(current.bindings[patch.binding], patch.word) != addressValue(patch.source, userData, words, vertex, draw)) return FailLostPatch;
             auto confirmed = patch;
             ++confirmed.confirmations;
             patches.push_back(confirmed);
@@ -472,7 +472,7 @@ std::optional<LearnFail> learn(const Entry& entry, Entry& next, const std::vecto
         }
         if (!fieldExists(previous, patch) || !fieldExists(current, patch) || !sourceExists(patch.source, userData.size(), words.size(), vertex)) continue;
         if (fieldValue(previous, patch) != sourceValue(patch.source, entry.userData, entry.words, entry.vertex, entry.draw)) continue;
-        if (fieldValue(current, patch) != sourceValue(patch.source, userData, words, vertex, draw)) continue;
+        if (fieldValue(current, patch) != sourceValue(patch.source, userData, words, vertex, draw)) return FailLostPatch;
         auto confirmed = patch;
         ++confirmed.confirmations;
         confirmed.overflow = overflows(sourceBase(patch.source, userData, words, vertex, draw), patch.source.delta);
