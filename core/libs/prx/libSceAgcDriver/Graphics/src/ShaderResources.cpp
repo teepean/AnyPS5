@@ -5789,15 +5789,33 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
-    auto result = std::make_shared<DrawBindings>();
+    std::shared_ptr<DrawBindings> result;
+    std::shared_ptr<DrawBindings> last;
+    if (!movedOnly && RepeatedDrawBindings()) {
+        last = lastDrawBindings.lock();
+        if (last != nullptr && last->cache != context.descriptorCache) last.reset();
+    }
+    std::size_t matched = 0;
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
-    const auto keep = [&](DrawBindings::Snapshot snapshot) {
-        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        result->snapshots.push_back(std::move(snapshot));
+    const auto startResult = [&] {
+        result = std::make_shared<DrawBindings>();
+        result->snapshots.reserve(allocations.size());
+        if (last != nullptr) result->snapshots.assign(last->snapshots.begin(), last->snapshots.begin() + static_cast<std::ptrdiff_t>(matched));
+    };
+    const auto keep = [&](std::uint64_t address, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset, std::size_t bytes) {
+        if (result == nullptr && last != nullptr && matched < last->snapshots.size()) {
+            const auto& held = last->snapshots[matched];
+            if (held.address == address && held.buffer == buffer && held.offset == offset && held.bytes == bytes) {
+                ++matched;
+                return;
+            }
+        }
+        if (result == nullptr) startResult();
+        result->snapshots.push_back({address, buffer, offset, bytes});
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -5805,10 +5823,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
-            std::shared_ptr<Buffer> buffer;
+            std::shared_ptr<Buffer> fresh;
+            const std::shared_ptr<Buffer>* buffer = &fresh;
             VkDeviceSize offset = 0;
             if (held != movedWordBuffers.end()) {
-                buffer = held->buffer;
+                buffer = &held->buffer;
                 offset = held->offset;
             } else {
                 auto slice = recorder.DrawUpload(override->size);
@@ -5816,14 +5835,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-                buffer = std::move(slice.buffer);
+                fresh = std::move(slice.buffer);
                 offset = slice.offset;
-                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer, offset};
+                MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, fresh, offset};
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
             selected.push_back(index);
-            keep({0, std::move(buffer), offset, override->size});
+            keep(0, *buffer, offset, override->size);
             continue;
         }
         std::uint64_t address = item.address;
@@ -5845,9 +5864,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamped = true;
         }
         VkDeviceSize offset = 0;
-        auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        const auto* cached = recorder.FindUnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
-        if (verifySnapshots && buffer != nullptr) {
+        if (verifySnapshots && cached != nullptr) {
+            const auto& buffer = *cached;
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
             VkDeviceSize slowOffset = 0;
@@ -5856,26 +5876,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
-        if (buffer == nullptr) {
+        std::shared_ptr<Buffer> fresh;
+        if (cached == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
-                buffer = std::move(slice.buffer);
+                fresh = std::move(slice.buffer);
                 offset = slice.offset;
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
-                buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
-                if (buffer == nullptr) {
-                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                fresh = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                if (fresh == nullptr) {
+                    fresh = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    std::memcpy(fresh->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, fresh);
                 }
             }
-            if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
+            if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, fresh, offset);
         }
         selected.push_back(index);
-        keep({begin, std::move(buffer), offset, bytes});
+        keep(begin, cached != nullptr ? *cached : fresh, offset, bytes);
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -5889,13 +5910,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             recorder.KeepBytes(kept, snapshot.buffer->Bytes().size());
         }
     };
-    if (!movedOnly && RepeatedDrawBindings()) {
-        if (auto last = lastDrawBindings.lock(); last != nullptr && last->cache == context.descriptorCache && lastDrawSelected == selected && last->snapshots.size() == result->snapshots.size() && std::equal(last->snapshots.begin(), last->snapshots.end(), result->snapshots.begin(), [](const DrawBindings::Snapshot& a, const DrawBindings::Snapshot& b) { return a.address == b.address && a.buffer == b.buffer && a.offset == b.offset && a.bytes == b.bytes; })) {
-            recorder.Keep(last);
-            keepBuffers(*last);
-            return last;
-        }
+    if (result == nullptr && last != nullptr && matched == last->snapshots.size() && lastDrawSelected == selected) {
+        recorder.Keep(last);
+        keepBuffers(*last);
+        return last;
     }
+    if (result == nullptr) startResult();
     result->cache = context.descriptorCache;
     if (bufferSlots.size() != descriptorBuffers.size() || allocationOffsets.size() != allocations.size()) {
         bufferSlots.assign(descriptorBuffers.size(), BufferSlot{0, 0, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});

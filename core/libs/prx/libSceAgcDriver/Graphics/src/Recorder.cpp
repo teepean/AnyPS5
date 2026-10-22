@@ -2800,17 +2800,22 @@ void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stam
     unwrittenStamp = stamp;
 }
 
-std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+const std::shared_ptr<Buffer>* Recorder::FindUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
-    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return nullptr;
     if (found->second.generation != stamp[0] && !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         unwrittenBytes -= found->second.bytes;
         unwrittenSnapshots.erase(found);
-        return {};
+        return nullptr;
     }
     if (offset != nullptr) *offset = found->second.offset;
-    return found->second.buffer;
+    return &found->second.buffer;
+}
+
+std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
+    const auto* found = FindUnwrittenDrawSnapshot(address, bytes, stamp, offset);
+    return found != nullptr ? *found : nullptr;
 }
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
