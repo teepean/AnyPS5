@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <typeinfo>
 #include <utility>
 #include <span>
 #include <vector>
@@ -67,8 +68,15 @@ private:
         std::vector<Follower> followers;
         std::uint32_t followerQueue = 0;
     };
+    struct KindTotals {
+        const std::type_info* type = nullptr;
+        std::uint64_t count = 0;
+        std::uint64_t ns = 0;
+        std::uint64_t followers = 0;
+    };
     bool attach(const Follower& follower, std::uint32_t queue);
     DrawPipeline() = default;
+    void noteKind(const Item& item, std::uint64_t spent);
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -99,6 +107,7 @@ private:
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
+    std::vector<KindTotals> kinds;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

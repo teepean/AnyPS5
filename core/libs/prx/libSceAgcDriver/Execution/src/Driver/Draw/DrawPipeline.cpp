@@ -5,6 +5,9 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include <algorithm>
+#if defined(__GNUC__)
+#include <cxxabi.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +25,32 @@ std::atomic<unsigned> runningCommitters{0};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+}
+
+std::string kindName(const std::type_info& type) {
+    std::string name = type.name();
+#if defined(__GNUC__)
+    int status = 0;
+    if (char* demangled = abi::__cxa_demangle(type.name(), nullptr, nullptr, &status); demangled != nullptr) {
+        if (status == 0) name = demangled;
+        std::free(demangled);
+    }
+#endif
+    std::string suffix;
+    if (const auto lambda = name.rfind("::{lambda"); lambda != std::string::npos) {
+        if (const auto hash = name.find('#', lambda); hash != std::string::npos) suffix = name.substr(hash, name.find('}', hash) - hash);
+        name.resize(lambda);
+    }
+    int depth = 0;
+    std::size_t open = std::string::npos;
+    for (std::size_t i = name.size(); i-- > 0;) {
+        if (name[i] == ')') ++depth;
+        else if (name[i] == '(' && --depth == 0) open = i;
+        if (open != std::string::npos) break;
+    }
+    if (open != std::string::npos) name.resize(open);
+    if (const auto scope = name.rfind("::"); scope != std::string::npos) name = name.substr(scope + 2);
+    return name + suffix;
 }
 
 std::atomic<std::uint64_t> heldReadRanges{0};
@@ -188,9 +217,27 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
     drainText += reads;
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; %llu sample dumps, %llu labels and %llu write-only seals attached to queued items;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(attachedDumps), static_cast<unsigned long long>(attachedLabels), static_cast<unsigned long long>(attachedSeals), reads, drainText.c_str());
+    std::sort(kinds.begin(), kinds.end(), [](const KindTotals& a, const KindTotals& b) { return a.ns > b.ns; });
+    std::string kindText;
+    for (const auto& kind : kinds) {
+        char item[200];
+        std::snprintf(item, sizeof(item), " %s %llu x %.2f us = %.0f ms (%llu followers);", kindName(*kind.type).c_str(), static_cast<unsigned long long>(kind.count), kind.count == 0 ? 0.0 : static_cast<double>(kind.ns) / 1e3 / static_cast<double>(kind.count), static_cast<double>(kind.ns) / 1e6, static_cast<unsigned long long>(kind.followers));
+        kindText += item;
+    }
+    std::fprintf(stderr, "[draw] committer items by kind (10 s):%s\n", kindText.c_str());
+    kinds.clear();
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = attachedDumps = attachedLabels = attachedSeals = 0;
     drains = {};
     drainWaitNs = {};
+}
+
+void DrawPipeline::noteKind(const Item& item, std::uint64_t spent) {
+    const auto* type = &item.commit.target_type();
+    auto found = std::find_if(kinds.begin(), kinds.end(), [&](const KindTotals& kind) { return kind.type == type; });
+    if (found == kinds.end()) found = kinds.insert(kinds.end(), KindTotals{type});
+    ++found->count;
+    found->ns += spent;
+    found->followers += item.followers.size();
 }
 
 void DrawPipeline::run() {
@@ -244,6 +291,7 @@ void DrawPipeline::run() {
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
         std::lock_guard lock(mutex);
+        if (profile) noteKind(items.front(), spent);
         finished.push_back(std::move(items.front()));
         items.pop_front();
         if (roomWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
