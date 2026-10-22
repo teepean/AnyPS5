@@ -135,6 +135,42 @@ State& state() {
     return *value;
 }
 
+struct LocalCounters {
+    std::uint64_t lookups = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t shared = 0;
+    std::uint64_t patchedWords = 0;
+    std::array<std::uint64_t, MissCount> misses{};
+    std::uint64_t checks = 0;
+    std::uint64_t recycled = 0;
+    std::uint64_t otherVariant = 0;
+    std::uint64_t fastTimed = 0;
+    double fastUs = 0.0;
+    std::uint32_t pending = 0;
+};
+thread_local LocalCounters localCounters;
+
+void mergeLocalCounters(State& value) {
+    auto& local = localCounters;
+    auto& c = value.counters;
+    c.lookups += local.lookups;
+    c.hits += local.hits;
+    c.shared += local.shared;
+    c.patchedWords += local.patchedWords;
+    for (std::size_t m = 0; m < MissCount; ++m) c.misses[m] += local.misses[m];
+    c.checks += local.checks;
+    c.recycled += local.recycled;
+    c.otherVariant += local.otherVariant;
+    c.fastTimed += local.fastTimed;
+    c.fastUs += local.fastUs;
+    local = LocalCounters{};
+}
+
+bool stageInstancesTimed() {
+    static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return timed;
+}
+
 struct RecycledSlot {
     std::shared_ptr<ShaderRecompiler::RecompileResult> result;
     std::shared_ptr<const void> owner;
@@ -610,8 +646,11 @@ std::uint64_t checkEvery() {
 
 void StageInstancesBeginDraw(std::uint64_t shapeKey) {
     currentShape = shapeKey;
+    thread_local std::uint32_t draws = 0;
+    if ((++draws & 1023u) != 0) return;
     auto& value = state();
     std::lock_guard lock(value.mutex);
+    mergeLocalCounters(value);
     report(value);
 }
 
@@ -770,15 +809,18 @@ Attempt attempt(const std::shared_ptr<const Entry>& held, std::span<const std::u
 
 std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<const std::uint32_t> userData, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, const std::array<std::uint32_t, 5>& draw, ShaderMemory& memory) {
     if (key == 0) return std::nullopt;
-    const auto started = std::chrono::steady_clock::now();
+    const bool timed = stageInstancesTimed();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& value = state();
+    auto& local = localCounters;
     std::shared_ptr<const Shape> held;
     {
         std::lock_guard lock(value.mutex);
-        ++value.counters.lookups;
+        if (++local.pending >= 256) mergeLocalCounters(value);
         const auto found = value.shapes.find(key);
         if (found != value.shapes.end()) held = found->second;
     }
+    ++local.lookups;
     std::optional<Miss> first;
     const std::vector<Run>* runsRead = nullptr;
     for (std::size_t v = 0; held != nullptr && v < held->variants.size(); ++v) {
@@ -788,21 +830,19 @@ std::optional<StageInstanceHit> StageInstanceTry(std::uint64_t key, std::span<co
             continue;
         }
         outcome.hit->variant = held->variants[v];
-        const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
-        std::lock_guard lock(value.mutex);
-        auto& c = value.counters;
-        if (outcome.changed) c.patchedWords += held->variants[v]->patches.size();
-        else ++c.shared;
-        if (outcome.recycled) ++c.recycled;
-        if (outcome.hit->check) ++c.checks;
-        if (v != 0) ++c.otherVariant;
-        ++c.hits;
-        ++c.fastTimed;
-        c.fastUs += elapsed;
+        if (outcome.changed) local.patchedWords += held->variants[v]->patches.size();
+        else ++local.shared;
+        if (outcome.recycled) ++local.recycled;
+        if (outcome.hit->check) ++local.checks;
+        if (v != 0) ++local.otherVariant;
+        ++local.hits;
+        if (timed) {
+            ++local.fastTimed;
+            local.fastUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        }
         return std::move(outcome.hit);
     }
-    std::lock_guard lock(value.mutex);
-    ++value.counters.misses[first.value_or(MissNoEntry)];
+    ++local.misses[first.value_or(MissNoEntry)];
     return std::nullopt;
 }
 
