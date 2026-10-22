@@ -784,6 +784,28 @@ public:
         staleUnits.assign(count, false);
         staleCount = 0;
         unitGeneration.assign(count, 0);
+        syncedFloor = 0;
+    }
+
+    std::uint64_t PlaneBytes(const GuestTextureResource& resource) const {
+        if (planeBytes == 0) planeBytes = DescribeSurface(resource).guestBytes;
+        return planeBytes;
+    }
+
+    bool AllStale() const {
+        return staleCount != 0 && staleCount == staleUnits.size();
+    }
+
+    bool AnyStaleIn(std::uint64_t planeBytes, std::uint64_t begin, std::uint64_t end) const {
+        const auto plane = target.address;
+        if (staleCount == 0 || unitBytes == 0 || begin >= end || begin >= plane + planeBytes || plane >= end) return false;
+        const auto from = std::max(begin, plane) - plane;
+        const auto to = std::min(end, plane + planeBytes) - plane;
+        const auto last = std::min<std::uint64_t>((to - 1u) / unitBytes, staleUnits.size() - 1u);
+        for (auto unit = from / unitBytes; unit <= last; ++unit) {
+            if (staleUnits[static_cast<std::size_t>(unit)]) return true;
+        }
+        return false;
     }
 
     bool AnyStale() const {
@@ -838,28 +860,43 @@ public:
     }
 
     std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
-        const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        const auto bytes = static_cast<std::size_t>(PlaneBytes(resource));
         SizeUnits(bytes);
         GuestMemory::CollectWrites(resource.baseAddress, bytes);
         generation = GuestMemory::TrackerGeneration();
         std::vector<bool> changed(unitGeneration.size(), false);
         if (unitGeneration.size() == 1u) {
-            changed[0] = GuestMemory::WrittenSince(resource.baseAddress, bytes, unitGeneration[0]);
+            changed[0] = GuestMemory::WrittenSince(resource.baseAddress, bytes, std::max(unitGeneration[0], syncedFloor));
             return changed;
         }
-        const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+        const auto oldest = std::max(*std::min_element(unitGeneration.begin(), unitGeneration.end()), syncedFloor);
         if (oldest != 0u && !GuestMemory::WrittenSince(resource.baseAddress, bytes, oldest)) return changed;
+        std::vector<std::uint64_t> generations(unitGeneration.size());
+        for (std::size_t unit = 0; unit < generations.size(); ++unit) generations[unit] = std::max(unitGeneration[unit], syncedFloor);
         std::vector<std::uint8_t> stamped(unitGeneration.size(), GuestMemory::BlockUnchanged);
-        if (!GuestMemory::ChangedBlocks(resource.baseAddress, bytes, unitGeneration, stamped)) return changed;
-        for (std::size_t unit = 0; unit < changed.size(); ++unit) changed[unit] = unitGeneration[unit] != 0u && stamped[unit] == GuestMemory::BlockWritten;
+        if (!GuestMemory::ChangedBlocks(resource.baseAddress, bytes, generations, stamped)) return changed;
+        for (std::size_t unit = 0; unit < changed.size(); ++unit) changed[unit] = generations[unit] != 0u && stamped[unit] == GuestMemory::BlockWritten;
         return changed;
     }
 
     void SyncFromMemory(const GuestTextureResource& resource) {
+        static const bool quietCheck = std::getenv("APS5_NO_DEPTH_SYNC_FLOOR") == nullptr;
+        if (quietCheck && syncedFloor != 0u) {
+            const auto bytes = static_cast<std::size_t>(PlaneBytes(resource));
+            SizeUnits(bytes);
+            if (syncedFloor != 0u) {
+                GuestMemory::CollectWrites(resource.baseAddress, bytes);
+                const auto current = GuestMemory::TrackerGeneration();
+                if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !GuestMemory::WrittenSince(resource.baseAddress, bytes, syncedFloor)) {
+                    syncedFloor = current;
+                    return;
+                }
+            }
+        }
         std::uint64_t generation = 0;
         const auto changed = WrittenUnits(resource, generation);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
-            unitGeneration.assign(unitGeneration.size(), generation);
+            syncedFloor = generation;
             return;
         }
         ClearStale(changed);
@@ -876,7 +913,7 @@ public:
                 static_cast<void>(mirrorPlane.storage->Refresh());
             }
         }
-        unitGeneration.assign(unitGeneration.size(), generation);
+        syncedFloor = generation;
         const auto mirror = mirrorPlane.storage;
         if (StoresUnits(*mirror)) {
             const auto rects = mirror->UnitRects(changed);
@@ -896,6 +933,7 @@ public:
     std::size_t staleCount = 0;
     std::vector<std::uint64_t> unitGeneration;
     std::uint64_t unitBytes = 0;
+    std::uint64_t syncedFloor = 0;
     bool syncing = false;
     mutable std::uint64_t planeBytes = 0;
     std::uint64_t scannedEpoch = 0;
@@ -1756,8 +1794,7 @@ GuestTextureResource mirrorResource(const DepthTarget& target) {
 }
 
 std::uint64_t mirrorPlaneBytes(const DepthSurface& surface) {
-    if (surface.planeBytes == 0) surface.planeBytes = DescribeSurface(mirrorResource(surface.target)).guestBytes;
-    return surface.planeBytes;
+    return surface.PlaneBytes(mirrorResource(surface.target));
 }
 
 std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surface) {
@@ -1986,8 +2023,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     if ((depthWritten || cleared) && mirrorable(target)) {
         const auto plane = target.address;
         const auto planeBytes = mirrorPlaneBytes(*surface);
-        surface->MarkAllStale(planeBytes);
-        noteStalePlane(plane, plane + planeBytes);
+        surface->SizeUnits(planeBytes);
+        if (!surface->AllStale()) {
+            surface->MarkAllStale(planeBytes);
+            noteStalePlane(plane, plane + planeBytes);
+        }
     }
     drawnDepth = surface;
     return surface->view;
@@ -2030,7 +2070,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
     if (flushing || !overlapsStalePlane(address, end)) return {};
     if (scope == DepthPlaneScope::Overlapped) {
         std::lock_guard lock(surfacesMutex());
-        const auto staleInRange = [&](const auto& surface) { return surface->AnyStale() && !surface->syncing && ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || anyUnit(surface->StaleUnitsIn(DescribeSurface(mirrorResource(surface->target)).guestBytes, address, end))); };
+        const auto staleInRange = [&](const auto& surface) { return surface->AnyStale() && !surface->syncing && ((surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || surface->AnyStaleIn(mirrorPlaneBytes(*surface), address, end)); };
         if (std::none_of(surfaces().begin(), surfaces().end(), staleInRange)) return {};
     }
     flushing = true;
@@ -2058,7 +2098,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
             const auto planeBytes = mirrorPlaneBytes(*surface);
             const bool overlapped = !surface->syncing && plane < end && address < plane + planeBytes;
             if (overlapped && (surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) surface->MarkAllStale(planeBytes);
-            if (overlapped && (scope == DepthPlaneScope::Whole || anyUnit(surface->StaleUnitsIn(planeBytes, address, end)))) {
+            if (overlapped && (scope == DepthPlaneScope::Whole || surface->AnyStaleIn(planeBytes, address, end))) {
                 surface->SyncFromMemory(resource);
                 auto units = scope == DepthPlaneScope::Whole ? surface->staleUnits : surface->StaleUnitsIn(planeBytes, address, end);
                 if (anyUnit(units)) {
