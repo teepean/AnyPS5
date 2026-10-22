@@ -2832,6 +2832,11 @@ struct RevalidateProfile {
 
 constexpr std::array<const char*, 11> ProofMemoNames{"hit", "none", "cpu writes", "epoch", "serials", "pending", "image", "key writer", "imports", "ranges", "renewed"};
 
+bool ForeignPendingMemo() {
+    static const bool enabled = std::getenv("APS5_FOREIGN_PENDING_MEMO") != nullptr;
+    return enabled;
+}
+
 bool OwnPendingMemo() {
     static const bool enabled = std::getenv("APS5_OWN_PENDING_MEMO") != nullptr;
     return enabled;
@@ -3434,7 +3439,10 @@ std::size_t ShaderResources::proofMemoMiss() {
     const bool pendingMoved = pendingSerialSeen == 0 || pendingSerialSeen != pendingSerial;
     if (pendingMoved) {
         if (memo.pendingExact) return 5;
-        if (!StorageTexture::PendingSurelyClear(memo.pendingRanges) && !(OwnPendingMemo() && StorageTexture::PendingClearExcept(memo.pendingRanges, memo.pendingExcepts))) return 5;
+        if (!StorageTexture::PendingSurelyClear(memo.pendingRanges) && !(OwnPendingMemo() && StorageTexture::PendingClearExcept(memo.pendingRanges, memo.pendingExcepts))) {
+            const bool held = std::none_of(memo.foreignHeld.begin(), memo.foreignHeld.end(), [](const auto& image) { return image.expired(); });
+            if (memo.foreign.empty() || !held || !StorageTexture::PendingClearExceptKnown(memo.pendingRanges, memo.pendingExcepts, memo.foreign)) return 5;
+        }
         for (const auto& [address, bytes] : memo.regionRanges) {
             if (AnyShadowedOverlaps(address, bytes)) return 5;
         }
@@ -3473,6 +3481,8 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     memo.pendingRanges.clear();
     memo.pendingExcepts.clear();
     memo.regionRanges.clear();
+    memo.foreign.clear();
+    memo.foreignHeld.clear();
     memo.depthRelevant = !storageTextures.empty();
     memo.pendingExact = false;
     if (before.generation == 0 || before.epoch == 0 || validatedTextures.size() != textures.size()) return;
@@ -3528,6 +3538,12 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     }
     memo.pendingRanges.insert(memo.pendingRanges.end(), memo.regionRanges.begin(), memo.regionRanges.end());
     memo.pendingExcepts.resize(memo.pendingRanges.size(), nullptr);
+    if (ForeignPendingMemo() && OwnPendingMemo()) {
+        for (auto& image : StorageTexture::ForeignPending(memo.pendingRanges, memo.pendingExcepts)) {
+            memo.foreign.emplace_back(image.get(), image->Version());
+            memo.foreignHeld.push_back(std::move(image));
+        }
+    }
     memo.generation = before.generation;
     memo.epoch = before.epoch;
     memo.unwatched = before.unwatched;

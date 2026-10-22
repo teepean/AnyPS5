@@ -4435,6 +4435,40 @@ bool StorageTexture::PendingClearExcept(std::span<const std::pair<std::uint64_t,
     return true;
 }
 
+std::vector<std::shared_ptr<StorageTexture>> StorageTexture::ForeignPending(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::span<const StorageTexture* const> excepts) {
+    std::vector<std::shared_ptr<StorageTexture>> found;
+    if (excepts.size() != ranges.size()) return found;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto [address, bytes] = ranges[i];
+        if (!pending.textures.MayOverlap(address, bytes)) continue;
+        for (auto* texture : pending.textures) {
+            if (texture == excepts[i] || !texture->overlaps(address, bytes)) continue;
+            if (std::any_of(found.begin(), found.end(), [&](const auto& held) { return held.get() == texture; })) continue;
+            if (auto alive = texture->weak_from_this().lock()) found.push_back(std::move(alive));
+        }
+    }
+    return found;
+}
+
+bool StorageTexture::PendingClearExceptKnown(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::span<const StorageTexture* const> excepts, std::span<const std::pair<const StorageTexture*, std::uint64_t>> known) {
+    if (excepts.size() != ranges.size()) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto listed = [&](const StorageTexture* texture) {
+        return std::any_of(known.begin(), known.end(), [&](const auto& entry) { return entry.first == texture && entry.second == texture->version; });
+    };
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto [address, bytes] = ranges[i];
+        if (pending.textures.AnyOverlapping(address, bytes, [&](const StorageTexture* texture) { return texture != excepts[i] && !listed(texture); })) return false;
+        for (const auto* texture : pending.flushing) {
+            if (texture != excepts[i] && texture->overlaps(address, bytes)) return false;
+        }
+    }
+    return true;
+}
+
 bool StorageTexture::PendingSurelyClear(std::span<const std::pair<std::uint64_t, std::size_t>> ranges) {
     auto& pending = Pending();
     if (!std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) { return pending.textures.SurelyClear(range.first, range.second); })) return false;

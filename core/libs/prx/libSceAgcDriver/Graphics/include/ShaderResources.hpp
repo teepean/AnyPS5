@@ -564,6 +564,8 @@ private:
         std::vector<std::pair<std::uint64_t, std::size_t>> regionRanges;
         std::vector<std::pair<std::uint64_t, std::size_t>> keyRanges;
         std::vector<std::pair<const StorageTexture*, std::uint64_t>> images;
+        std::vector<std::pair<const StorageTexture*, std::uint64_t>> foreign;
+        std::vector<std::weak_ptr<StorageTexture>> foreignHeld;
     };
     bool revalidate(std::span<const CompiledShader> shaders, ProofReport* report);
     bool completeCpuWrites();
