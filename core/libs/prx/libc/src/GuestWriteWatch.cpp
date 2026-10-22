@@ -121,7 +121,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
-        if (_freshCount.load(std::memory_order_acquire) == 0 && Covers(begin, end)) return scanWritten(begin, end, written, context);
+        if (!freshOverlaps(begin, end) && Covers(begin, end)) return scanWritten(begin, end, written, context);
         if (!takeFresh(begin, end, true, written, context)) return false;
         return scanWritten(begin, end, written, context);
     }
@@ -131,7 +131,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
-        if (_freshCount.load(std::memory_order_acquire) == 0) return true;
+        if (!freshOverlaps(begin, end)) return true;
         {
             std::shared_lock lock(_lock);
             auto it = _fresh.upper_bound(begin);
@@ -147,7 +147,7 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
-        if (_freshCount.load(std::memory_order_acquire) == 0 && Covers(begin, end)) return scanWritten(begin, end, written, context);
+        if (!freshOverlaps(begin, end) && Covers(begin, end)) return scanWritten(begin, end, written, context);
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armed;
         {
             std::shared_lock lock(_lock);
@@ -171,6 +171,26 @@ public:
 private:
     void syncFresh() {
         _freshCount.store(_fresh.size(), std::memory_order_release);
+        _freshVersion.fetch_add(1, std::memory_order_release);
+    }
+
+    bool freshOverlaps(std::uintptr_t begin, std::uintptr_t end) {
+        if (_freshCount.load(std::memory_order_acquire) == 0) return false;
+        struct Copy {
+            const Watch* owner = nullptr;
+            std::uint64_t version = 0;
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+        };
+        thread_local Copy copy;
+        if (const auto version = _freshVersion.load(std::memory_order_acquire); copy.owner != this || copy.version != version) {
+            std::shared_lock lock(_lock);
+            copy.ranges.assign(_fresh.begin(), _fresh.end());
+            copy.version = _freshVersion.load(std::memory_order_relaxed);
+            copy.owner = this;
+        }
+        auto next = std::upper_bound(copy.ranges.begin(), copy.ranges.end(), begin, [](std::uintptr_t value, const auto& range) { return value < range.first; });
+        if (next != copy.ranges.begin() && std::prev(next)->second > begin) return true;
+        return next != copy.ranges.end() && next->first < end;
     }
 
     bool takeFresh(std::uintptr_t begin, std::uintptr_t end, bool whole, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) {
@@ -350,6 +370,7 @@ private:
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
     std::atomic<std::size_t> _freshCount{0};
+    std::atomic<std::uint64_t> _freshVersion{0};
     std::atomic<std::uint64_t> _version{0};
 };
 
