@@ -109,6 +109,10 @@ public:
         return next != copy.ranges.begin() && std::prev(next)->second >= end;
     }
 
+    std::uint64_t Version() const {
+        return _version.load(std::memory_order_acquire);
+    }
+
     bool Overlaps(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available()) return false;
         std::shared_lock lock(_lock);
@@ -839,6 +843,14 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
     static_cast<void>(written);
     static_cast<void>(context);
     return false;
+#endif
+}
+
+std::uint64_t GuestWriteWatchVersion_nid_postfix() {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    return Watch::Get().Version();
+#else
+    return 0;
 #endif
 }
 

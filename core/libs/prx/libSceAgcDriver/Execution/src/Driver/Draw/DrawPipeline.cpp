@@ -91,7 +91,12 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
-void DrawPipeline::FollowEpoch(std::uint64_t token) {
+void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t collectEpoch) {
+    static const bool adopt = std::getenv("APS5_NO_ADOPTED_COLLECT_EPOCH") == nullptr;
+    if (adopt && collectEpoch != 0) {
+        GuestMemory::AdoptCollectEpoch(collectEpoch);
+        return;
+    }
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
@@ -243,6 +248,7 @@ void DrawPipeline::noteKind(const Item& item, std::uint64_t spent) {
 void DrawPipeline::run() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PerformanceTrace::BindThread("draw committer");
+    GuestMemory::MarkCollectDemandThread();
     StartCommitterSampler();
     bool taken = false;
     Commit* commit = nullptr;

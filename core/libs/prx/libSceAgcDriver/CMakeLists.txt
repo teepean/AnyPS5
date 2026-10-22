@@ -729,6 +729,16 @@ if(BUILD_TESTING AND NOT WIN32)
     set_target_properties(agc_collect_memo_generation_tests PROPERTIES CXX_EXTENSIONS OFF)
     add_test(NAME agc_collect_memo_generation COMMAND agc_collect_memo_generation_tests)
     set_tests_properties(agc_collect_memo_generation PROPERTIES TIMEOUT 30)
+    add_test_executable(agc_collect_in_flight_tests
+            tests/CollectInFlight.cpp
+            Execution/src/GuestMemory.cpp
+            Execution/src/PerformanceTraceThread.cpp
+    )
+    target_include_directories(agc_collect_in_flight_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_collect_in_flight_tests PRIVATE shader_recompiler_agc_driver libc)
+    set_target_properties(agc_collect_in_flight_tests PROPERTIES CXX_EXTENSIONS OFF)
+    add_test(NAME agc_collect_in_flight COMMAND agc_collect_in_flight_tests)
+    set_tests_properties(agc_collect_in_flight PROPERTIES TIMEOUT 60)
 endif()
 
 add_test_executable(agc_thread_priority_tests EXCLUDE_FROM_ALL

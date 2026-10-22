@@ -488,10 +488,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto recipe = keepVariant != nullptr ? keepVariant->recipe.load(std::memory_order_acquire) : nullptr;
         auto recipeOwner = keepVariant != nullptr ? keepVariant : attachVariant;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto collectEpoch = GuestMemory::CollectEpoch();
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant = std::move(recipeOwner), dataHit, epoch] {
-            DrawPipeline::FollowEpoch(epoch);
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant = std::move(recipeOwner), dataHit, epoch, collectEpoch] {
+            DrawPipeline::FollowEpoch(epoch, collectEpoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();

@@ -498,6 +498,45 @@ void CheckWatchedMiddleStore() {
     Require(StoreOwnBytes(base + page / 2, 3 * page, [&] { std::memset(reinterpret_cast<void*>(base + page / 2), 0x22, 3 * page); }) == 0, "an own store around the watched middle of a block is trusted");
     Require(!UnchangedSince(middle, 2 * page, beforeOwn), "an own store around the watched middle of a block left it unchanged");
 }
+
+void CheckWalkedBlocks() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    const auto walkElsewhere = [](std::uint64_t address, std::size_t size) {
+        std::uint64_t generation = 0;
+        std::thread([&] {
+            BumpCollectEpoch();
+            generation = CollectWrites(address, size);
+        }).join();
+        return generation;
+    };
+    BumpCollectEpoch();
+    const auto before = CollectWrites(base, 4 * Block);
+    Require(before != 0, "the walked blocks are not watched");
+    BumpCollectEpoch();
+    bytes[Block] = 0x22;
+    walkElsewhere(base, 4 * Block);
+    const auto served = CollectWrites(base + Block, Block);
+    Require(served != 0 && !UnchangedSince(base + Block, Block, before), "another thread's walk hid a store ordered before this thread's epoch");
+    Require(UnchangedSince(base + 2 * Block, Block, served), "another thread's walk changed an unwritten block");
+    const auto earlier = walkElsewhere(base, 4 * Block);
+    bytes[2 * Block] = 0x33;
+    BumpCollectEpoch();
+    Require(CollectWrites(base + 2 * Block, Block) != 0 && !UnchangedSince(base + 2 * Block, Block, earlier), "a walk made before this thread's epoch served its collect");
+    BumpCollectEpoch();
+    walkElsewhere(base, 4 * Block);
+    Unwatch(base + 3 * Block, Block);
+    Require(CollectWrites(base, 4 * Block) == 0, "walked blocks served a collect over memory unwatched after the walk");
+    BumpCollectEpoch();
+    const auto registered = walkElsewhere(base, 2 * Block);
+    Require(registered != 0, "the registered blocks were not walked");
+    Require(GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, 2 * Block), "cannot unregister the walked blocks");
+    bytes[0] = 0x44;
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, 2 * Block);
+    Require(CollectWrites(base, 2 * Block) != 0 && !UnchangedSince(base, Block, registered), "walked blocks served a collect over memory registered again after the walk");
+}
 #endif
 
 void CheckCoarseRuns() {
@@ -1459,6 +1498,7 @@ int main() {
 #ifndef _WIN32
         CheckWatchOverlaps();
         CheckWatchedMiddleStore();
+        CheckWalkedBlocks();
 #endif
         CheckCoarseRuns();
 #ifdef _WIN32
