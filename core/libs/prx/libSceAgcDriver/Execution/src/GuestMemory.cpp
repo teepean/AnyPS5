@@ -854,14 +854,15 @@ struct WriteTracker {
     static constexpr std::size_t CoarseBlocks = 64;
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     struct Leaf {
-        std::array<std::uint32_t, LeafBlocks> blocks{};
-        std::array<std::uint32_t, LeafBlocks> cpuBlocks{};
-        std::array<std::uint32_t, LeafBlocks / CoarseBlocks> coarseBlocks{};
+        std::array<std::atomic<std::uint32_t>, LeafBlocks> blocks{};
+        std::array<std::atomic<std::uint32_t>, LeafBlocks> cpuBlocks{};
+        std::array<std::atomic<std::uint32_t>, LeafBlocks / CoarseBlocks> coarseBlocks{};
 #ifdef _WIN32
         std::array<std::uint32_t, LeafBlocks> hintBlocks{};
 #endif
     };
-    std::vector<std::unique_ptr<Leaf>> leaves;
+    std::unique_ptr<std::atomic<Leaf*>[]> leaves;
+    std::atomic<bool> ready{false};
 #ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -897,17 +898,22 @@ struct WriteTracker {
     void initialize() {
         if (initialized) return;
         initialized = true;
+        initializeOnce();
+        ready.store(true, std::memory_order_release);
+    }
+
+    void initializeOnce() {
 #ifdef _WIN32
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
-        leaves.resize((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
+        leaves = std::make_unique<std::atomic<Leaf*>[]>((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
         coverage.Initialize(base, size);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
-        if (watched) leaves.resize(LeafCount);
+        if (watched) leaves = std::make_unique<std::atomic<Leaf*>[]>(LeafCount);
 #endif
     }
 
@@ -1061,9 +1067,17 @@ struct WriteTracker {
     }
 
     Leaf& leafFor(std::uint64_t block) {
-        auto& leaf = leaves[block / LeafBlocks];
-        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
+        auto& slot = leaves[block / LeafBlocks];
+        auto* leaf = slot.load(std::memory_order_relaxed);
+        if (leaf == nullptr) {
+            leaf = new Leaf();
+            slot.store(leaf, std::memory_order_release);
+        }
         return *leaf;
+    }
+
+    Leaf* leafAt(std::uint64_t index) const {
+        return leaves != nullptr ? leaves[index].load(std::memory_order_acquire) : nullptr;
     }
 
 #ifdef _WIN32
@@ -1072,14 +1086,14 @@ struct WriteTracker {
     }
 
     std::uint32_t hintOf(std::uint64_t block) const {
-        const auto& leaf = leaves[block / LeafBlocks];
+        const auto* leaf = leafAt(block / LeafBlocks);
         return leaf != nullptr ? leaf->hintBlocks[block % LeafBlocks] : 0;
     }
 #endif
 
     std::uint32_t stampOf(std::uint64_t block) const {
-        const auto& leaf = leaves[block / LeafBlocks];
-        return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
+        const auto* leaf = leafAt(block / LeafBlocks);
+        return leaf != nullptr ? leaf->blocks[block % LeafBlocks].load(std::memory_order_relaxed) : 0;
     }
 
     static constexpr std::size_t UnstampedSlots = 1u << 16;
@@ -1117,23 +1131,23 @@ struct WriteTracker {
     }
 
     std::uint32_t coarseStampOf(std::uint64_t block) const {
-        const auto& leaf = leaves[block / LeafBlocks];
-        return leaf != nullptr ? leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks] : 0;
+        const auto* leaf = leafAt(block / LeafBlocks);
+        return leaf != nullptr ? leaf->coarseBlocks[(block % LeafBlocks) / CoarseBlocks].load(std::memory_order_relaxed) : 0;
     }
 
     bool unchanged(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
         if (first == last) return stampOf(first) <= since;
-        const auto newer = [since](std::uint32_t stamp) { return stamp > since; };
         while (first <= last) {
-            const auto& leaf = leaves[first / LeafBlocks];
+            const auto* leaf = leafAt(first / LeafBlocks);
             if (leaf == nullptr) {
                 first = (first / LeafBlocks + 1) * LeafBlocks;
                 continue;
             }
             const auto end = std::min<std::uint64_t>(last + 1, (first / CoarseBlocks + 1) * CoarseBlocks);
             if (end - first < CoarseBlocks || coarseStampOf(first) > since) {
-                const auto begin = leaf->blocks.begin() + first % LeafBlocks;
-                if (std::any_of(begin, begin + (end - first), newer)) return false;
+                for (auto block = first; block < end; ++block) {
+                    if (leaf->blocks[block % LeafBlocks].load(std::memory_order_relaxed) > since) return false;
+                }
             }
             first = end;
         }
@@ -1141,8 +1155,8 @@ struct WriteTracker {
     }
 
     std::uint32_t cpuStampOf(std::uint64_t block) const {
-        const auto& leaf = leaves[block / LeafBlocks];
-        return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks] : 0;
+        const auto* leaf = leafAt(block / LeafBlocks);
+        return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks].load(std::memory_order_relaxed) : 0;
     }
 
     bool storedOver(std::uint64_t address, std::uint64_t end, std::uint64_t generation, bool walked) const {
@@ -1185,16 +1199,16 @@ struct WriteTracker {
         const bool stored = kind != StampKind::ImportWindow;
         auto& leaf = leafFor(block);
         if (stored) {
-            leaf.blocks[block % LeafBlocks] = stampGeneration;
+            leaf.blocks[block % LeafBlocks].store(stampGeneration, std::memory_order_relaxed);
             auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
-            coarse = std::max(coarse, stampGeneration);
+            if (coarse.load(std::memory_order_relaxed) < stampGeneration) coarse.store(stampGeneration, std::memory_order_relaxed);
         }
-        if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
+        if (cpu) leaf.cpuBlocks[block % LeafBlocks].store(stampGeneration, std::memory_order_relaxed);
     }
 };
 
 WriteTracker& Tracker() {
-    static WriteTracker tracker;
+    static auto& tracker = *new WriteTracker;
     return tracker;
 }
 
@@ -1256,7 +1270,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
-        if (const auto& leaf = tracker.leaves[block / WriteTracker::LeafBlocks]; leaf != nullptr) leaf->hintBlocks[block % WriteTracker::LeafBlocks] = 0;
+        if (auto* leaf = tracker.leafAt(block / WriteTracker::LeafBlocks); leaf != nullptr) leaf->hintBlocks[block % WriteTracker::LeafBlocks] = 0;
         if (const auto found = tracker.driverPieces.find(block); found != tracker.driverPieces.end()) found->second.dropped = std::max<std::uint32_t>(found->second.dropped, tracker.generation);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
@@ -1704,6 +1718,14 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
+#ifndef _WIN32
+    if (tracker.ready.load(std::memory_order_acquire)) {
+        if (!tracker.watched || generation == 0 || !tracker.covers(address, bytes)) return false;
+        if (tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation)) return true;
+        const auto lock = lockTracker(tracker);
+        return !tracker.storedOver(address, address + bytes, generation, true);
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
@@ -1712,6 +1734,24 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     auto& tracker = Tracker();
+#ifndef _WIN32
+    if (tracker.ready.load(std::memory_order_acquire)) {
+        if (!tracker.watched) return false;
+        for (std::size_t index = 0; index < queries.size(); ++index) {
+            const auto& [address, bytes, generation] = queries[index];
+            if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+            if (tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation)) continue;
+            const auto lock = lockTracker(tracker);
+            for (auto rest = index; rest < queries.size(); ++rest) {
+                const auto& [restAddress, restBytes, restGeneration] = queries[rest];
+                if (restGeneration == 0 || restBytes == 0 || !tracker.covers(restAddress, restBytes)) return false;
+                if (!tracker.rangeUnchanged(restAddress, restBytes, restGeneration)) return false;
+            }
+            return true;
+        }
+        return true;
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return false;
@@ -1874,6 +1914,9 @@ std::uint64_t TrackerGenerationUnlocked() {
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
+#ifndef _WIN32
+    return tracker.stable.load(std::memory_order_acquire);
+#endif
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
@@ -1967,6 +2010,12 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
+#ifndef _WIN32
+    if (tracker.ready.load(std::memory_order_acquire)) {
+        if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+        return !tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
@@ -1975,6 +2024,13 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 
 bool WrittenSinceCurrent(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t& current) {
     auto& tracker = Tracker();
+#ifndef _WIN32
+    if (tracker.ready.load(std::memory_order_acquire)) {
+        current = tracker.stable.load(std::memory_order_acquire);
+        if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+        return !tracker.unchanged(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     current = tracker.generation;
