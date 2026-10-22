@@ -874,6 +874,7 @@ struct WriteTracker {
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
+    std::atomic<std::uint32_t> stable{1};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1199,16 +1200,51 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
-    std::unique_lock lock(tracker.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        trackerWaits.fetch_add(1, std::memory_order_relaxed);
+class TrackerLock {
+public:
+    explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!profile) {
+            lock.lock();
+            return;
+        }
+        if (!lock.try_lock()) {
+            trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            lock.lock();
+        }
+        trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~TrackerLock() {
+        if (lock.owns_lock()) publish();
+    }
+    TrackerLock(const TrackerLock&) = delete;
+    TrackerLock& operator=(const TrackerLock&) = delete;
+
+    void Unlock() {
+        publish();
+        lock.unlock();
+    }
+
+    void Suspend() {
+        lock.unlock();
+    }
+
+    void Resume() {
         lock.lock();
     }
-    trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
-    return lock;
+
+private:
+    void publish() {
+        const auto current = tracker.generation.load(std::memory_order_relaxed);
+        if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);
+    }
+
+    WriteTracker& tracker;
+    std::unique_lock<std::mutex> lock;
+};
+
+TrackerLock lockTracker(WriteTracker& tracker) {
+    return TrackerLock(tracker);
 }
 
 #ifdef _WIN32
@@ -1413,7 +1449,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.generation.load(std::memory_order_relaxed);
+                return tracker.stable.load(std::memory_order_acquire);
             }
         }
         for (const auto& entry : threadCollectMemo.entries) {
@@ -1422,12 +1458,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.generation.load(std::memory_order_relaxed);
+                return tracker.stable.load(std::memory_order_acquire);
             }
         }
         if (epochCollectMapEnabled() && collectSpansEnabled() && spanCollected(epochCollectMap(epoch), unwatched, mapping, first, stop)) {
             if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-            return tracker.generation.load(std::memory_order_relaxed);
+            return tracker.stable.load(std::memory_order_acquire);
         }
     }
     const auto lock = lockTracker(tracker);
@@ -1598,7 +1634,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) {
-        lock.unlock();
+        lock.Unlock();
         return import();
     }
     constexpr std::uint64_t page = 4096;
@@ -1776,9 +1812,9 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
-            lock.unlock();
+            lock.Suspend();
             beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
-            lock.lock();
+            lock.Resume();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
@@ -1833,7 +1869,7 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 }
 
 std::uint64_t TrackerGenerationUnlocked() {
-    return Tracker().generation.load(std::memory_order_acquire);
+    return Tracker().stable.load(std::memory_order_acquire);
 }
 
 std::uint64_t TrackerGeneration() {
