@@ -3419,6 +3419,7 @@ bool ShaderResources::completeCpuWrites() {
 
 std::size_t ShaderResources::proofMemoMiss() {
     auto& memo = proofMemo;
+    memoForeignHit = false;
     if (!memo.valid) return 1;
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     if (memo.epoch == 0 || epoch == 0) return 3;
@@ -3442,6 +3443,7 @@ std::size_t ShaderResources::proofMemoMiss() {
         if (!StorageTexture::PendingSurelyClear(memo.pendingRanges) && !(OwnPendingMemo() && StorageTexture::PendingClearExcept(memo.pendingRanges, memo.pendingExcepts))) {
             const bool held = std::none_of(memo.foreignHeld.begin(), memo.foreignHeld.end(), [](const auto& image) { return image.expired(); });
             if (memo.foreign.empty() || !held || !StorageTexture::PendingClearExceptKnown(memo.pendingRanges, memo.pendingExcepts, memo.foreign)) return 5;
+            memoForeignHit = true;
         }
         for (const auto& [address, bytes] : memo.regionRanges) {
             if (AnyShadowedOverlaps(address, bytes)) return 5;
@@ -3540,7 +3542,7 @@ void ShaderResources::takeProofMemo(const ProofMemo& before) {
     memo.pendingExcepts.resize(memo.pendingRanges.size(), nullptr);
     if (ForeignPendingMemo() && OwnPendingMemo()) {
         for (auto& image : StorageTexture::ForeignPending(memo.pendingRanges, memo.pendingExcepts)) {
-            memo.foreign.emplace_back(image.get(), image->Version());
+            memo.foreign.emplace_back(image.get(), image->PendingSignature());
             memo.foreignHeld.push_back(std::move(image));
         }
     }
@@ -3591,12 +3593,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     before.allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     before.depthSurfaces = DepthSurfacesSerial();
     proofMemo.valid = false;
+    ProofReport local;
+    if (report == nullptr) report = &local;
     const bool ok = revalidate(shaders, report);
     if (miss == 0) {
         auto& counts = Revalidations();
         (ok ? counts.memoVerified : counts.memoWrong).fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> reported{0};
-        if (!ok && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOF_MEMO: the memo held but the proof failed (path %zu, failure %zu, %zu textures, %zu storage images)\n", report != nullptr ? static_cast<std::size_t>(report->path) : 0, report != nullptr ? static_cast<std::size_t>(report->failure) : 0, textures.size(), storageTextures.size());
+        if (!ok && reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOF_MEMO: the memo held but the proof failed (path %zu, failure %zu, %zu textures, %zu storage images, held over %zu foreign pending images: %s)\n", report != nullptr ? static_cast<std::size_t>(report->path) : 0, report != nullptr ? static_cast<std::size_t>(report->failure) : 0, textures.size(), storageTextures.size(), proofMemo.foreign.size(), memoForeignHit ? "yes" : "no");
     }
     if (ok) takeProofMemo(before);
     return ok;

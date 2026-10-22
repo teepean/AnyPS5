@@ -4435,6 +4435,16 @@ bool StorageTexture::PendingClearExcept(std::span<const std::pair<std::uint64_t,
     return true;
 }
 
+std::uint64_t StorageTexture::PendingSignature() const {
+    std::uint64_t signature = version * 0x9E3779B97F4A7C15ull + trackedLayers;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        const auto pendingBit = layer < layerPending.size() ? layerPending[layer] : 0u;
+        const auto generation = layer < layerGeneration.size() ? layerGeneration[layer] : 0u;
+        signature = (signature ^ (generation * 2u + (pendingBit != 0 ? 1u : 0u))) * 0x100000001B3ull;
+    }
+    return signature;
+}
+
 std::vector<std::shared_ptr<StorageTexture>> StorageTexture::ForeignPending(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::span<const StorageTexture* const> excepts) {
     std::vector<std::shared_ptr<StorageTexture>> found;
     if (excepts.size() != ranges.size()) return found;
@@ -4457,7 +4467,7 @@ bool StorageTexture::PendingClearExceptKnown(std::span<const std::pair<std::uint
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto listed = [&](const StorageTexture* texture) {
-        return std::any_of(known.begin(), known.end(), [&](const auto& entry) { return entry.first == texture && entry.second == texture->version; });
+        return std::any_of(known.begin(), known.end(), [&](const auto& entry) { return entry.first == texture && entry.second == texture->PendingSignature(); });
     };
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         const auto [address, bytes] = ranges[i];

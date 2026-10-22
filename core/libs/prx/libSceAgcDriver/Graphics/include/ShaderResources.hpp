@@ -568,6 +568,7 @@ private:
         std::vector<std::weak_ptr<StorageTexture>> foreignHeld;
     };
     bool revalidate(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool memoForeignHit = false;
     bool completeCpuWrites();
     std::size_t proofMemoMiss();
     void takeProofMemo(const ProofMemo& before);
