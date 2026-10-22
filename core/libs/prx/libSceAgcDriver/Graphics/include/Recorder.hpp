@@ -860,6 +860,9 @@ private:
     GraphicsBinding boundGraphics;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
+    struct UploadChunks;
+    std::shared_ptr<Buffer> takeUploadChunk();
+    std::shared_ptr<UploadChunks> uploadChunks;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

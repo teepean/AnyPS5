@@ -2782,11 +2782,54 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+namespace {
+constexpr std::size_t UploadChunkLimit = 16;
+constexpr VkBufferUsageFlags DrawUploadUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+bool UploadChunkReuse() {
+    static const bool enabled = std::getenv("APS5_NO_UPLOAD_CHUNK_REUSE") == nullptr;
+    return enabled;
+}
+}
+
+struct Recorder::UploadChunks {
+    UploadChunks() { free.reserve(UploadChunkLimit); }
+    ~UploadChunks() {
+        for (auto* chunk : free) delete chunk;
+    }
+    std::mutex mutex;
+    std::vector<Buffer*> free;
+};
+
+std::shared_ptr<Buffer> Recorder::takeUploadChunk() {
+    if (!UploadChunkReuse()) return std::make_shared<Buffer>(context, DrawUploadChunk, DrawUploadUsage);
+    if (uploadChunks == nullptr) uploadChunks = std::make_shared<UploadChunks>();
+    Buffer* chunk = nullptr;
+    {
+        std::lock_guard lock(uploadChunks->mutex);
+        if (!uploadChunks->free.empty()) {
+            chunk = uploadChunks->free.back();
+            uploadChunks->free.pop_back();
+        }
+    }
+    if (chunk == nullptr) chunk = new Buffer(context, DrawUploadChunk, DrawUploadUsage);
+    return std::shared_ptr<Buffer>(chunk, [home = std::weak_ptr<UploadChunks>(uploadChunks)](Buffer* used) {
+        if (const auto chunks = home.lock()) {
+            std::lock_guard lock(chunks->mutex);
+            if (chunks->free.size() < UploadChunkLimit) {
+                chunks->free.push_back(used);
+                return;
+            }
+        }
+        delete used;
+    });
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        drawUpload = bytes <= DrawUploadChunk ? takeUploadChunk() : std::make_shared<Buffer>(context, bytes, DrawUploadUsage);
         offset = 0;
     }
     drawUploadUsed = offset + bytes;
