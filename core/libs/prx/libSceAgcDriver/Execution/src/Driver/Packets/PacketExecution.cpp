@@ -242,6 +242,7 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -250,6 +251,8 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        const bool usesDevice = opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader;
+        if (!usesDevice && deviceUse.owns_lock()) deviceUse.unlock();
         auto nextCursor = cursor + count;
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
@@ -283,8 +286,7 @@ void Driver::execute(const Submission& submission) {
         }
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
-        std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
-        if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
+        if (usesDevice && !deviceUse.owns_lock()) deviceUse.lock();
 
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
@@ -347,15 +349,12 @@ void Driver::execute(const Submission& submission) {
 
         const bool waitPacket = opcode == 0x3c || opcode == 0x93 || header == RenderingWaitPacketHeader;
         struct Progress {
-            Driver& driver;
-            bool counted;
+            PacketProgress* counters;
             ~Progress() {
-                if (!counted) return;
-                --driver.packetsInFlight;
-                ++driver.packetsDone;
+                if (counters != nullptr) counters->finished.store(counters->finished.load(std::memory_order_relaxed) + 1, std::memory_order_release);
             }
-        } progress{*this, !waitPacket};
-        if (!waitPacket) ++packetsInFlight;
+        } progress{waitPacket ? nullptr : &packetProgress[submission.queue]};
+        if (progress.counters != nullptr) progress.counters->started.store(progress.counters->started.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
@@ -532,6 +531,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    if (deviceUse.owns_lock()) deviceUse.unlock();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

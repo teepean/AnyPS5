@@ -105,10 +105,18 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
+std::pair<std::uint64_t, std::uint64_t> Driver::packetTotals() const {
+    std::uint64_t done = 0;
+    std::uint64_t started = 0;
+    for (const auto& counters : packetProgress) done += counters.finished.load(std::memory_order_acquire);
+    for (const auto& counters : packetProgress) started += counters.started.load(std::memory_order_relaxed);
+    return {done, started - done};
+}
+
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
     auto start = std::chrono::steady_clock::now();
-    auto lastDone = packetsDone.load();
+    auto lastDone = packetTotals().first;
 
     GuestMemory::TagGpuLockThread(queue);
     auto& outcomes = waitOutcomes();
@@ -361,7 +369,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
             }
         }
-        if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
+        if (const auto [done, inFlight] = packetTotals(); done != lastDone || (!requireMemory && inFlight != 0)) {
             lastDone = done;
             start = std::chrono::steady_clock::now();
             stall.Progressed();

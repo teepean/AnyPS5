@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -356,10 +357,14 @@ private:
     std::mutex eopSelfSignalMutex;
     std::unordered_map<std::uint32_t, std::uint32_t> eopSelfSignalFlips;
 
-    alignas(64) std::atomic<int> packetsInFlight{0};
-    std::atomic<std::uint64_t> packetsDone{0};
+    struct alignas(64) PacketProgress {
+        std::atomic<std::uint64_t> started{0};
+        std::atomic<std::uint64_t> finished{0};
+    };
+    std::array<PacketProgress, SubmissionQueueEnd> packetProgress{};
+    std::pair<std::uint64_t, std::uint64_t> packetTotals() const;
 
-    std::atomic<std::uint64_t> eventSerial{0};
+    alignas(64) std::atomic<std::uint64_t> eventSerial{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
