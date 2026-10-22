@@ -1343,7 +1343,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
     }
 #ifndef _WIN32
-    collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled()) collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -1373,7 +1373,7 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         return true;
     };
     if (!walk(singlePass || fresh)) return false;
-    if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled() && runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return fresh || singlePass || runs.stamped == 0 || walk(true);
 }
 #endif
@@ -1384,10 +1384,11 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #ifdef _WIN32
     return collectWindowsWrites(runs, first, stop, armedOnly);
 #else
-    const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
+    const bool profiled = MemoryProfiled();
+    const auto dirtyRuns = profiled ? collectDirtyRuns.load(std::memory_order_relaxed) : 0;
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
-    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (profiled && collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
 }
@@ -1411,7 +1412,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
@@ -1420,12 +1421,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
         if (epochCollectMapEnabled() && collectSpansEnabled() && spanCollected(epochCollectMap(epoch), unwatched, mapping, first, stop)) {
-            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
             return tracker.generation.load(std::memory_order_relaxed);
         }
     }
@@ -1436,7 +1437,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
         }
@@ -1867,7 +1868,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
     }
-    if (marked) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled() && marked) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -1891,7 +1892,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
-        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
