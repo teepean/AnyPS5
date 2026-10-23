@@ -3996,7 +3996,11 @@ void drawSnapshotPatchTests(const Device& device) {
         const auto snapshot = [&] {
             auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            auto buffer = bindings->snapshots[0].buffer;
+            std::shared_ptr<Buffer> buffer;
+            for (const auto& held : bindings->buffers) {
+                if (held.get() == bindings->snapshots[0].buffer) buffer = held;
+            }
+            Require(buffer != nullptr, "draw bindings do not hold their snapshot's buffer");
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
@@ -4099,7 +4103,11 @@ void drawSnapshotEpochTests(const Device& device) {
         const auto snapshot = [&] {
             auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
-            auto buffer = bindings->snapshots[0].buffer;
+            std::shared_ptr<Buffer> buffer;
+            for (const auto& held : bindings->buffers) {
+                if (held.get() == bindings->snapshots[0].buffer) buffer = held;
+            }
+            Require(buffer != nullptr, "draw bindings do not hold their snapshot's buffer");
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
