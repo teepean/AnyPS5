@@ -5500,6 +5500,13 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     }
 }
 
+bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto end = address + bytes;
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), [&](const auto& region) { return region.direct != nullptr && address < region.end && region.begin < end; })) return true;
+    return std::any_of(regions.begin(), regions.end(), [&](const auto& region) { return region.direct != nullptr && address < inPlaceEnd(region) && region.begin < end; });
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);

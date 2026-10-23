@@ -6079,7 +6079,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+        guestMemory.InPlaceReads(reads);
+        recorder.NotePendingReads(reads, kind);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -6123,11 +6126,6 @@ void ShaderResources::WriteBackBuffers() {
     }
     if (!SkipWriteBack()) guestMemory.WriteBack();
     if (unaligned) std::rethrow_exception(unaligned);
-}
-
-bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
