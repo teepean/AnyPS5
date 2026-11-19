@@ -1,3 +1,5 @@
+> **This branch, `stray-anykyty`:** Stray (PPSA02100) on AnyKyty on Linux, at its 60 FPS cap at the start of Dead City with stock game settings. Build, setup and play instructions: **[docs/user/STRAY_ANYKYTY.md](docs/user/STRAY_ANYKYTY.md)**.
+
 > **AnyKyty** is AnyPS5 with the Kyty graphics core: **182.9 FPS** in Subnautica uncapped, against 112.4 for native Kyty on the same PC (Ryzen 9 7950X3D, RTX 4080 SUPER).
 > Linux and Windows, built from source. Contributors and game reports are welcome: **[the AnyKyty page](docs/user/ANYKYTY.md)** has the numbers, the build commands, the settings and how to contribute.
 
